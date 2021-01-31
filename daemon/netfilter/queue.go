@@ -236,7 +236,8 @@ func go_callback(queueID C.int, data *C.uchar, length C.int, mark C.uint, idx ui
 			}
 		}
 
-	case <-time.After(1 * time.Millisecond):
+		//default:
+	case <-time.After(10 * time.Millisecond):
 		fmt.Fprintf(os.Stderr, "Timed out while sending packet to queue channel %d\n", idx)
 	}
 }

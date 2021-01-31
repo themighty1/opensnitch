@@ -16,7 +16,6 @@ import (
 
 	"github.com/evilsocket/opensnitch/daemon/conman"
 	"github.com/evilsocket/opensnitch/daemon/core"
-	"github.com/evilsocket/opensnitch/daemon/dns"
 	"github.com/evilsocket/opensnitch/daemon/firewall"
 	"github.com/evilsocket/opensnitch/daemon/log"
 	"github.com/evilsocket/opensnitch/daemon/netfilter"
@@ -59,7 +58,7 @@ var (
 )
 
 func init() {
-	flag.StringVar(&procmonMethod, "process-monitor-method", procmonMethod, "How to search for processes path. Options: ftrace, audit (experimental), proc (default)")
+	flag.StringVar(&procmonMethod, "process-monitor-method", procmonMethod, "How to search for processes path. Options: ebpf, ftrace, audit (experimental), proc (default)")
 	flag.StringVar(&uiSocket, "ui-socket", uiSocket, "Path the UI gRPC service listener (https://github.com/grpc/grpc/blob/master/doc/naming.md).")
 	flag.StringVar(&rulesPath, "rules-path", rulesPath, "Path to load JSON rules from.")
 	flag.IntVar(&queueNum, "queue-num", queueNum, "Netfilter queue number.")
@@ -178,11 +177,11 @@ func doCleanup(queue, repeatQueue *netfilter.Queue) {
 
 func onPacket(packet netfilter.Packet) {
 	// DNS response, just parse, track and accept.
-	if dns.TrackAnswers(packet.Packet) == true {
-		packet.SetVerdictAndMark(netfilter.NF_ACCEPT, packet.Mark)
-		stats.OnDNSResponse()
-		return
-	}
+	// if dns.TrackAnswers(packet.Packet) == true {
+	// 	packet.SetVerdictAndMark(netfilter.NF_ACCEPT, packet.Mark)
+	// 	stats.OnDNSResponse()
+	// 	return
+	// }
 
 	// Parse the connection state
 	con := conman.Parse(packet, uiClient.InterceptUnknown())
@@ -192,7 +191,8 @@ func onPacket(packet netfilter.Packet) {
 	}
 	// accept our own connections
 	if con.Process.ID == os.Getpid() {
-		packet.SetVerdict(netfilter.NF_ACCEPT)
+		fmt.Println("accept our own connection")
+		packet.SetVerdictAndMark(netfilter.NF_ACCEPT, packet.Mark)
 		return
 	}
 
@@ -222,10 +222,13 @@ func acceptOrDeny(packet *netfilter.Packet, con *conman.Connection) *rule.Rule {
 		if uiClient.Connected() == false || uiClient.GetIsAsking() == true {
 			applyDefaultAction(packet)
 			log.Debug("UI is not running or busy")
+			fmt.Println("UI is not running or busy")
 			return nil
 		}
 
+		fmt.Println("will set isAsking")
 		uiClient.SetIsAsking(true)
+		fmt.Println("after set isAsking")
 		defer uiClient.SetIsAsking(false)
 
 		// In order not to block packet processing, we send our packet to a different netfilter queue
@@ -239,21 +242,26 @@ func acceptOrDeny(packet *netfilter.Packet, con *conman.Connection) *rule.Rule {
 		case pkt, o = <-repeatPktChan:
 			if !o {
 				log.Debug("error while receiving packet from repeatPktChan")
+				fmt.Println("error while receiving packet from repeatPktChan")
 				return nil
 			}
 		case <-time.After(1 * time.Second):
 			log.Debug("timed out while receiving packet from repeatPktChan")
+			fmt.Println("timed out while receiving packet from repeatPktChan")
 			return nil
 		}
 
 		//check if the pulled out packet is the same we put in
 		if res := bytes.Compare(packet.Packet.Data(), pkt.Packet.Data()); res != 0 {
 			log.Error("The packet which was requeued has changed abruptly. This should never happen. Please report this incident to the Opensnitch developers. %s %s ", packet, pkt)
+			fmt.Println("The packet which was requeued has changed abruptly")
 			return nil
 		}
 		packet = &pkt
 
+		fmt.Println("before uiClient.Ask(con)")
 		r = uiClient.Ask(con)
+		fmt.Println("after uiClient.Ask(con)")
 		if r == nil {
 			log.Error("Invalid rule received, applying default action")
 			applyDefaultAction(packet)
@@ -319,6 +327,7 @@ func acceptOrDeny(packet *netfilter.Packet, con *conman.Connection) *rule.Rule {
 }
 
 func main() {
+
 	ctx, cancel = context.WithCancel(context.Background())
 	defer cancel()
 	flag.Parse()
@@ -378,6 +387,7 @@ func main() {
 	// the option via command line.
 	if procmonMethod != "" {
 		procmon.SetMonitorMethod(procmonMethod)
+		fmt.Println("procmonMethod", procmonMethod)
 	}
 	procmon.Init()
 

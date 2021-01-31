@@ -3,6 +3,7 @@ package procmon
 import (
 	"time"
 
+	"github.com/evilsocket/opensnitch/daemon/ebpf"
 	"github.com/evilsocket/opensnitch/daemon/log"
 	"github.com/evilsocket/opensnitch/daemon/procmon/audit"
 )
@@ -68,6 +69,13 @@ func SetMonitorMethod(newMonitorMethod string) {
 	monitorMethod = newMonitorMethod
 }
 
+func MethodIsEbpf() bool {
+	lock.RLock()
+	defer lock.RUnlock()
+
+	return monitorMethod == MethodEbpf
+}
+
 func methodIsFtrace() bool {
 	lock.RLock()
 	defer lock.RUnlock()
@@ -93,6 +101,8 @@ func methodIsProc() bool {
 func End() {
 	if methodIsAudit() {
 		audit.Stop()
+	} else if MethodIsEbpf() {
+		ebpf.Stop()
 	} else if methodIsFtrace() {
 		go func() {
 			if err := Stop(); err != nil {
@@ -104,7 +114,15 @@ func End() {
 
 // Init starts parsing connections using the method specified.
 func Init() {
-	if methodIsFtrace() {
+	if MethodIsEbpf() {
+		err := ebpf.Start()
+		if err == nil {
+			log.Info("Process monitor method ebpf")
+			return
+		}
+		log.Warning("error starting ebpf monitor method: %v", err)
+
+	} else if methodIsFtrace() {
 		err := Start()
 		if err == nil {
 			log.Info("Process monitor method ftrace")

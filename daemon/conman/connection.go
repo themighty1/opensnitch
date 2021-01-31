@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 
 	"github.com/evilsocket/opensnitch/daemon/core"
 	"github.com/evilsocket/opensnitch/daemon/dns"
+	"github.com/evilsocket/opensnitch/daemon/ebpf"
 	"github.com/evilsocket/opensnitch/daemon/log"
 	"github.com/evilsocket/opensnitch/daemon/netfilter"
 	"github.com/evilsocket/opensnitch/daemon/netlink"
@@ -64,12 +66,18 @@ func Parse(nfp netfilter.Packet, interceptUnknown bool) *Connection {
 
 }
 
+var stats []string
+var loops int
+
 func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (cr *Connection, err error) {
 	// no errors but not enough info neither
 	if c.parseDirection(protoType) == false {
+		fmt.Printf("no errors but not enough info neither")
+		fmt.Println("packet is", nfp)
 		return nil, nil
 	}
-	log.Debug("new connection %s => %d:%v -> %v:%d uid: %d", c.Protocol, c.SrcPort, c.SrcIP, c.DstIP, c.DstPort, nfp.UID)
+
+	fmt.Printf("new connection %s => %d:%v -> %v:%d uid: \n", c.Protocol, c.SrcPort, c.SrcIP, c.DstIP, c.DstPort)
 
 	c.Entry = &netstat.Entry{
 		Proto:   c.Protocol,
@@ -79,6 +87,83 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (
 		DstPort: c.DstPort,
 		UserId:  -1,
 		INode:   -1,
+	}
+
+	start := time.Now()
+	if procmon.MethodIsEbpf() {
+		loops++
+
+		pid := ebpf.GetPid(c.Protocol, c.SrcPort, c.SrcIP, c.DstIP, c.DstPort)
+		var uid int
+		var inodeList []int
+
+		if pid != -1 {
+			goto FoundPid
+		}
+		//check if it comes from already established TCP
+		if c.Protocol == "tcp" || c.Protocol == "tcp6" {
+			var err error
+			//TODO: we should have a monitoring thread which queries netlink to see if the
+			//4-tuple + inode is still active. If not, it should be removed from already established
+			pid, err = ebpf.FindInAlreadyEstablishedTCP(c.Protocol, c.SrcPort, c.SrcIP, c.DstIP, c.DstPort)
+			if err == nil && pid != -1 {
+				fmt.Println("found in already established", pid)
+				goto FoundPid
+			}
+		}
+
+		//using netlink.GetSocketInfo to check the UID
+		uid, inodeList = netlink.GetSocketInfo(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort)
+		fmt.Println("Results from netlink", uid, inodeList)
+
+		// //else not found in ebpf.FindInAlreadyEstablished
+		if uid == 0 {
+			// must be an in-kernel connection
+			//TODO send a popup to user to accept/deny
+			var proc procmon.Process
+			c.Process = &proc
+			c.Process.ID = os.Getpid()
+			return c, nil
+		}
+
+		if !ebpf.FindAddressInLocalAddresses(c.SrcIP) {
+			//systemd-resolved sometimes makes a TCP Fast Open connection to a DNS server (8.8.8.8 on my machine)
+			//and we get a packet here with source IP 8.8.8.8
+			//This must be some sort of in-kernel response with spoofed IP because wireshark does not show either
+			//resolved's TCP Fast Open packet, neither the response
+			//Until this mistery is understood, we simply do not allow this machine to make connections with
+			//arbitrary source IPs
+			return nil, fmt.Errorf("Packet with unknown source IP: %s", c.SrcIP)
+		}
+
+		fmt.Println("This connection needs to be investigated")
+		ebpf.PrintEverything("1")
+		time.Sleep(time.Second * 1)
+		ebpf.PrintEverything("2")
+
+		fmt.Println("packet is", nfp)
+		for {
+			//spin forever while we dump all maps with bpftool in another terminal
+			time.Sleep(time.Second * 100)
+		}
+
+	FoundPid:
+		stats = append(stats, time.Since(start).String())
+		fmt.Printf("took time to find match %v \n", time.Since(start))
+		if c.Process = procmon.FindProcess(pid, showUnknownCons); c.Process == nil {
+			fmt.Printf("Could not find process by its pid %d for: %s", pid, c)
+			return nil, fmt.Errorf("Could not find process by its pid %d for: %s", pid, c)
+		}
+		//fmt.Printf("took time to find process by pid %v \n", time.Since(start))
+		if loops > 15 {
+			for _, v := range stats {
+				fmt.Println(v)
+			}
+			loops = 0
+			stats = nil
+		}
+		fmt.Println("found process:", c.Process.Path)
+		return c, nil
 	}
 
 	// 0. lookup uid and inode via netlink. Can return several inodes.
@@ -120,9 +205,11 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (
 			break
 		}
 	}
+	fmt.Printf("took time to find match %v \n", time.Since(start))
 	if c.Process = procmon.FindProcess(pid, showUnknownCons); c.Process == nil {
 		return nil, fmt.Errorf("Could not find process by its pid %d for: %s", pid, c)
 	}
+	fmt.Printf("took time to find process by pid %v \n", time.Since(start))
 
 	return c, nil
 
