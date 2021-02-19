@@ -16,6 +16,7 @@ import (
 
 	"github.com/evilsocket/opensnitch/daemon/conman"
 	"github.com/evilsocket/opensnitch/daemon/core"
+	"github.com/evilsocket/opensnitch/daemon/dns"
 	"github.com/evilsocket/opensnitch/daemon/firewall"
 	"github.com/evilsocket/opensnitch/daemon/log"
 	"github.com/evilsocket/opensnitch/daemon/netfilter"
@@ -177,12 +178,12 @@ func doCleanup(queue, repeatQueue *netfilter.Queue) {
 }
 
 func onPacket(packet netfilter.Packet) {
-	// DNS response, just parse, track and accept.
-	// if dns.TrackAnswers(packet.Packet) == true {
-	// 	packet.SetVerdictAndMark(netfilter.NF_ACCEPT, packet.Mark)
-	// 	stats.OnDNSResponse()
-	// 	return
-	// }
+	//DNS response, just parse, track and accept.
+	if dns.TrackAnswers(packet.Packet) == true {
+		packet.SetVerdictAndMark(netfilter.NF_ACCEPT, packet.Mark)
+		stats.OnDNSResponse()
+		return
+	}
 
 	// Parse the connection state
 	con := conman.Parse(packet, uiClient.InterceptUnknown())

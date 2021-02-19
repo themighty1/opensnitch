@@ -133,6 +133,7 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (
 			//resolved's TCP Fast Open packet, neither the response
 			//Until this mistery is understood, we simply do not allow this machine to make connections with
 			//arbitrary source IPs
+			fmt.Println("Packet with unknown source IP")
 			return nil, fmt.Errorf("Packet with unknown source IP: %s", c.SrcIP)
 		}
 

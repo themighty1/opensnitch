@@ -114,17 +114,17 @@ struct tcpv6sock_value_t {
 };
 
 
-BPF_HASH(udpMapOdd, struct udp_key_t, struct udp_value_t, MAPSIZE+2000);
-BPF_HASH(udpMapEven, struct udp_key_t, struct udp_value_t, MAPSIZE+2000);
+BPF_HASH(udpMapOdd, struct udp_key_t, struct udp_value_t, MAPSIZE+MAPCACHESIZE*2);
+BPF_HASH(udpMapEven, struct udp_key_t, struct udp_value_t, MAPSIZE+MAPCACHESIZE*2);
 
-BPF_HASH(udpv6MapOdd, struct udpv6_key_t, struct udpv6_value_t, MAPSIZE+2000);
-BPF_HASH(udpv6MapEven, struct udpv6_key_t, struct udpv6_value_t, MAPSIZE+2000);
+BPF_HASH(udpv6MapOdd, struct udpv6_key_t, struct udpv6_value_t, MAPSIZE+MAPCACHESIZE*2);
+BPF_HASH(udpv6MapEven, struct udpv6_key_t, struct udpv6_value_t, MAPSIZE+MAPCACHESIZE*2);
 
-BPF_HASH(tcpMapOdd, struct tcp_key_t, struct tcp_value_t, MAPSIZE+2000);  
-BPF_HASH(tcpMapEven, struct tcp_key_t, struct tcp_value_t, MAPSIZE+2000);
+BPF_HASH(tcpMapOdd, struct tcp_key_t, struct tcp_value_t, MAPSIZE+MAPCACHESIZE*2);  
+BPF_HASH(tcpMapEven, struct tcp_key_t, struct tcp_value_t, MAPSIZE+MAPCACHESIZE*2);
 
-BPF_HASH(tcpv6MapOdd, struct tcpv6_key_t, struct tcpv6_value_t, MAPSIZE+2000);
-BPF_HASH(tcpv6MapEven, struct tcpv6_key_t, struct tcpv6_value_t, MAPSIZE+2000);
+BPF_HASH(tcpv6MapOdd, struct tcpv6_key_t, struct tcpv6_value_t, MAPSIZE+MAPCACHESIZE*2);
+BPF_HASH(tcpv6MapEven, struct tcpv6_key_t, struct tcpv6_value_t, MAPSIZE+MAPCACHESIZE*2);
 
 //for TCP the IP-tuple will be known only upon return, so we stash the socket here to 
 //look it up upon return 
@@ -173,8 +173,8 @@ int kretprobe__tcp_v4_connect(struct pt_regs *ctx)
 	u32 modulo = *val % (MAPSIZE*2);  
 	if (modulo < MAPSIZE){ //from 0 to 4999 goes into odd map
 		tcpMapOdd.update(&tcp_key, &tcp_value);
-		if (modulo >= (MAPSIZE-1000) || modulo < 1000){
-			//mirror the first and the last 1000 entries in another map
+		if (modulo >= (MAPSIZE-MAPCACHESIZE) || modulo < MAPCACHESIZE){
+			//mirror the first and the last MAPCACHESIZE entries in another map
 			struct tcp_key_t tcp_key2 = {};
 			tcp_key2.dport = skp->__sk_common.skc_dport;
 			tcp_key2.sport = inet_sk(skp)->inet_sport;
@@ -190,8 +190,8 @@ int kretprobe__tcp_v4_connect(struct pt_regs *ctx)
 	}
 	else {
 		tcpMapEven.update(&tcp_key, &tcp_value);
-		if (modulo >= (MAPSIZE*2-1000) || modulo < (MAPSIZE+1000) ){
-			//mirror the the first and last 1000 entries in another map
+		if (modulo >= (MAPSIZE*2-MAPCACHESIZE) || modulo < (MAPSIZE+MAPCACHESIZE) ){
+			//mirror the the first and last MAPCACHESIZE entries in another map
 			struct tcp_key_t tcp_key2 = {};
 			tcp_key2.dport = skp->__sk_common.skc_dport;
 			tcp_key2.sport = inet_sk(skp)->inet_sport;
@@ -206,9 +206,7 @@ int kretprobe__tcp_v4_connect(struct pt_regs *ctx)
 		}
 	}
 
-	bpf_trace_printk("dumping packet : %d %d \\n", ntohs(tcp_key.sport), ntohs(tcp_key.dport));
 	tcpcounter.increment(0);
-
 	tcpsock.delete(&pid);
 	return 0;
 };
@@ -252,14 +250,14 @@ int kretprobe__tcp_v6_connect(struct pt_regs *ctx)
 	u32 modulo = *val % (MAPSIZE*2);  
 	if (modulo < MAPSIZE){
 		tcpv6MapOdd.update(&tcpv6_key, &tcpv6_value);
-		if (modulo >= (MAPSIZE-1000) || modulo < 1000){
+		if (modulo >= (MAPSIZE-MAPCACHESIZE) || modulo < MAPCACHESIZE){
 			tcpv6MapEven.update(&tcpv6_key, &tcpv6_value);
 		}
 	}
 	else {
 		tcpv6MapEven.update(&tcpv6_key, &tcpv6_value);
-		if (modulo >= (MAPSIZE*2-1000) || modulo < (MAPSIZE+1000)){
-			//mirror the last 1000 entries in another map
+		if (modulo >= (MAPSIZE*2-MAPCACHESIZE) || modulo < (MAPSIZE+MAPCACHESIZE)){
+			//mirror the last MAPCACHESIZE entries in another map
 			tcpv6MapOdd.update(&tcpv6_key, &tcpv6_value);
 		}
 	}
@@ -317,14 +315,14 @@ int kprobe__udp_sendmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg
 
 		if (oddMap){
 			udpMapOdd.update(&udp_key, &udp_value);
-			if (modulo >= (MAPSIZE-1000) || modulo < 1000){
+			if (modulo >= (MAPSIZE-MAPCACHESIZE) || modulo < MAPCACHESIZE){
 				//mirror the last 1000 entries in another map
 				udpMapEven.update(&udp_key, &udp_value);
 			}
 		}
 		else {
 			udpMapEven.update(&udp_key, &udp_value);
-			if (modulo >= (MAPSIZE*2-1000) || modulo < (MAPSIZE+1000)){
+			if (modulo >= (MAPSIZE*2-MAPCACHESIZE) || modulo < (MAPSIZE+MAPCACHESIZE)){
 				//mirror the last 1000 entries in another map
 				udpMapOdd.update(&udp_key, &udp_value);
 			}
@@ -383,14 +381,14 @@ int kprobe__udpv6_sendmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *m
 
 		if (oddMap){
 			udpv6MapOdd.update(&udpv6_key, &udpv6_value);
-			if (modulo >= (MAPSIZE-1000) || modulo < 1000){
+			if (modulo >= (MAPSIZE-MAPCACHESIZE) || modulo < MAPCACHESIZE){
 				//mirror the last 1000 entries in another map
 				udpv6MapEven.update(&udpv6_key, &udpv6_value);
 			}
 		}
 		else {
 			udpv6MapEven.update(&udpv6_key, &udpv6_value);
-			if (modulo >= (MAPSIZE*2-1000) || modulo < (MAPSIZE+1000)){
+			if (modulo >= (MAPSIZE*2-MAPCACHESIZE) || modulo < (MAPSIZE+MAPCACHESIZE)){
 				//mirror the last 1000 entries in another map
 				udpv6MapOdd.update(&udpv6_key, &udpv6_value);
 			}
@@ -478,8 +476,11 @@ type lookup_valuev6_t struct {
 }
 
 var (
-	m                       *bpf.Module
-	mapSize                 = 500000
+	m       *bpf.Module
+	mapSize = 500000
+	// mapCacheSize is the size of the cache we build to make a smooth
+	// switch from odd<->even maps
+	mapCacheSize            = 10000
 	ebpfMaps                map[string]*ebpfMapsForProto
 	alreadyEstablishedTCP   = make(map[*daemonNetlink.Socket]int)
 	alreadyEstablishedTCPv6 = make(map[*daemonNetlink.Socket]int)
@@ -499,6 +500,7 @@ var (
 //Start installs ebpf kprobes
 func Start() error {
 	source = strings.ReplaceAll(source, "MAPSIZE", strconv.Itoa(mapSize))
+	source = strings.ReplaceAll(source, "MAPCACHESIZE", strconv.Itoa(mapCacheSize))
 
 	m = bpf.NewModule(source, []string{})
 	tcpcounter := bpf.NewTable(m.TableId("tcpcounter"), m)
@@ -612,6 +614,7 @@ func Start() error {
 
 	go monitorAndSwitchMaps()
 	go monitorLocalAddresses()
+	go monitorAlreadyEstablished()
 
 	return nil
 }
@@ -646,7 +649,7 @@ func monitorAndSwitchMaps() {
 				ebpfMap.waitingToPurgeEven = true
 				ebpfMap.Unlock()
 			}
-			if ebpfMap.waitingToPurgeEven && modulo >= 1000 {
+			if ebpfMap.waitingToPurgeEven && modulo >= uint64(mapCacheSize) {
 				err = ebpfMap.mapEven.DeleteAll()
 				if err != nil {
 					fmt.Println("error in hashmap.id.Delete", err)
@@ -661,7 +664,7 @@ func monitorAndSwitchMaps() {
 				ebpfMap.waitingToPurgeOdd = true
 				ebpfMap.Unlock()
 			}
-			if ebpfMap.waitingToPurgeOdd && modulo >= uint64(mapSize+1000) {
+			if ebpfMap.waitingToPurgeOdd && modulo >= uint64(mapSize+mapCacheSize) {
 				err = ebpfMap.mapOdd.DeleteAll()
 				if err != nil {
 					fmt.Println("error in hashmap.id.Delete", err)
@@ -796,6 +799,65 @@ func monitorLocalAddresses() {
 		}
 		localAddressesLock.Unlock()
 		time.Sleep(time.Second * 1)
+		if stop {
+			return
+		}
+	}
+}
+
+func monitorAlreadyEstablished() {
+	for {
+		time.Sleep(time.Second * 1)
+		if stop {
+			return
+		}
+		socketListTCP, err := daemonNetlink.SocketsDump(uint8(syscall.AF_INET), uint8(syscall.IPPROTO_TCP))
+		if err != nil {
+			fmt.Println("error in SocketsDump")
+			continue
+		}
+		for aesock := range alreadyEstablishedTCP {
+			found := false
+			for _, sock := range socketListTCP {
+				if (*aesock).INode == (*sock).INode &&
+					//inodes are unique enough, so the matches below will never have to be checked
+					(*aesock).ID.SourcePort == (*sock).ID.SourcePort &&
+					(*aesock).ID.Source.Equal((*sock).ID.Source) &&
+					(*aesock).ID.Destination.Equal((*sock).ID.Destination) &&
+					(*aesock).ID.DestinationPort == (*sock).ID.DestinationPort &&
+					(*aesock).UID == (*sock).UID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				delete(alreadyEstablishedTCP, aesock)
+			}
+		}
+
+		socketListTCPv6, err := daemonNetlink.SocketsDump(uint8(syscall.AF_INET6), uint8(syscall.IPPROTO_TCP))
+		if err != nil {
+			fmt.Println("error in SocketsDump")
+			continue
+		}
+		for aesock := range alreadyEstablishedTCPv6 {
+			found := false
+			for _, sock := range socketListTCPv6 {
+				if (*aesock).INode == (*sock).INode &&
+					//inodes are unique enough, so the matches below will never have to be checked
+					(*aesock).ID.SourcePort == (*sock).ID.SourcePort &&
+					(*aesock).ID.Source.Equal((*sock).ID.Source) &&
+					(*aesock).ID.Destination.Equal((*sock).ID.Destination) &&
+					(*aesock).ID.DestinationPort == (*sock).ID.DestinationPort &&
+					(*aesock).UID == (*sock).UID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				delete(alreadyEstablishedTCPv6, aesock)
+			}
+		}
 	}
 }
 
