@@ -14,6 +14,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/evilsocket/opensnitch/daemon/procmon"
 	"github.com/vishvananda/netlink"
 
 	daemonNetlink "github.com/evilsocket/opensnitch/daemon/netlink"
@@ -589,7 +590,8 @@ func Start() error {
 	for _, sock := range socketListTCP {
 		fmt.Println(*sock)
 		inode := int((*sock).INode)
-		pid := lookupPidInProc("/proc/", fmt.Sprintf("socket:[%d]", inode), inode)
+		pid := procmon.GetPIDFromINode(inode, fmt.Sprint(inode,
+			(*sock).ID.Source, (*sock).ID.SourcePort, (*sock).ID.Destination, (*sock).ID.DestinationPort))
 		fmt.Println(pid)
 		alreadyEstablishedTCP[sock] = pid
 	}
@@ -601,7 +603,9 @@ func Start() error {
 	for _, sock := range socketListTCPv6 {
 		fmt.Println(*sock)
 		inode := int((*sock).INode)
-		pid := lookupPidInProc("/proc/", fmt.Sprintf("socket:[%d]", inode), inode)
+		pid := procmon.GetPIDFromINode(inode, fmt.Sprint(inode,
+			(*sock).ID.Source, (*sock).ID.SourcePort, (*sock).ID.Destination, (*sock).ID.DestinationPort))
+
 		fmt.Println(pid)
 		alreadyEstablishedTCPv6[sock] = pid
 	}
@@ -837,74 +841,4 @@ func PrintEverything(suffix string) {
 		fmt.Println("socket udp6: ", sockets[idx])
 	}
 
-}
-
-func lookupPidInProc(pidsPath, expect string, inode int) int {
-	pidList := getProcPids(pidsPath)
-	for _, pid := range pidList {
-		if inodeFound(pidsPath, expect, inode, pid) {
-			return pid
-		}
-	}
-	return -1
-}
-
-// getProcPids returns the list of running PIDs, /proc or /proc/<pid>/task/ .
-func getProcPids(pidsPath string) (pidList []int) {
-	f, err := os.Open(pidsPath)
-	if err != nil {
-		return pidList
-	}
-	ls, err := f.Readdir(-1)
-	f.Close()
-	if err != nil {
-		return pidList
-	}
-
-	for _, f := range ls {
-		if f.IsDir() == false {
-			continue
-		}
-		if pid, err := strconv.Atoi(f.Name()); err == nil {
-			pidList = append(pidList, []int{pid}...)
-		}
-	}
-
-	return pidList
-}
-
-func inodeFound(pidsPath, expect string, inode, pid int) bool {
-	fdPath := fmt.Sprint(pidsPath, pid, "/fd/")
-	fdList := lookupPidDescriptors(fdPath)
-	if fdList == nil {
-		return false
-	}
-
-	for idx := 0; idx < len(fdList); idx++ {
-		descLink := fmt.Sprint(fdPath, fdList[idx])
-		if link, err := os.Readlink(descLink); err == nil && link == expect {
-			return true
-		}
-	}
-
-	return false
-}
-
-func lookupPidDescriptors(fdPath string) []string {
-	f, err := os.Open(fdPath)
-	if err != nil {
-		return nil
-	}
-	fdList, err := f.Readdir(-1)
-	f.Close()
-	if err != nil {
-		return nil
-	}
-
-	s := make([]string, len(fdList))
-	for n, f := range fdList {
-		s[n] = f.Name()
-	}
-
-	return s
 }
