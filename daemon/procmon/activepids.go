@@ -26,7 +26,7 @@ var (
 //monitorActivePids checks that each process in activePids
 //is still running and if not running (or another process with the same pid is running),
 //removes the pid from activePids
-func monitorActivePids() {
+func MonitorActivePids() {
 	for {
 		time.Sleep(time.Second)
 		activePidsLock.Lock()

@@ -2,10 +2,6 @@ package procmon
 
 import (
 	"time"
-
-	"github.com/evilsocket/opensnitch/daemon/ebpf"
-	"github.com/evilsocket/opensnitch/daemon/log"
-	"github.com/evilsocket/opensnitch/daemon/procmon/audit"
 )
 
 // man 5 proc; man procfs
@@ -76,14 +72,14 @@ func MethodIsEbpf() bool {
 	return monitorMethod == MethodEbpf
 }
 
-func methodIsFtrace() bool {
+func MethodIsFtrace() bool {
 	lock.RLock()
 	defer lock.RUnlock()
 
 	return monitorMethod == MethodFtrace
 }
 
-func methodIsAudit() bool {
+func MethodIsAudit() bool {
 	lock.RLock()
 	defer lock.RUnlock()
 
@@ -95,53 +91,4 @@ func methodIsProc() bool {
 	defer lock.RUnlock()
 
 	return monitorMethod == MethodProc
-}
-
-// End stops the way of parsing new connections.
-func End() {
-	if methodIsAudit() {
-		audit.Stop()
-	} else if MethodIsEbpf() {
-		ebpf.Stop()
-	} else if methodIsFtrace() {
-		go func() {
-			if err := Stop(); err != nil {
-				log.Warning("procmon.End() stop ftrace error: %v", err)
-			}
-		}()
-	}
-}
-
-// Init starts parsing connections using the method specified.
-func Init() {
-	if MethodIsEbpf() {
-		err := ebpf.Start()
-		if err == nil {
-			log.Info("Process monitor method ebpf")
-			return
-		}
-		log.Warning("error starting ebpf monitor method: %v", err)
-
-	} else if methodIsFtrace() {
-		err := Start()
-		if err == nil {
-			log.Info("Process monitor method ftrace")
-			return
-		}
-		log.Warning("error starting ftrace monitor method: %v", err)
-
-	} else if methodIsAudit() {
-		auditConn, err := audit.Start()
-		if err == nil {
-			log.Info("Process monitor method audit")
-			go audit.Reader(auditConn, (chan<- audit.Event)(audit.EventChan))
-			return
-		}
-		log.Warning("error starting audit monitor method: %v", err)
-	}
-
-	// if any of the above methods have failed, fallback to proc
-	log.Info("Process monitor method /proc")
-	SetMonitorMethod(MethodProc)
-	go monitorActivePids()
 }

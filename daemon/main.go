@@ -20,6 +20,7 @@ import (
 	"github.com/evilsocket/opensnitch/daemon/log"
 	"github.com/evilsocket/opensnitch/daemon/netfilter"
 	"github.com/evilsocket/opensnitch/daemon/procmon"
+	"github.com/evilsocket/opensnitch/daemon/procmon/monitor"
 	"github.com/evilsocket/opensnitch/daemon/rule"
 	"github.com/evilsocket/opensnitch/daemon/statistics"
 	"github.com/evilsocket/opensnitch/daemon/ui"
@@ -152,7 +153,7 @@ func setupWorkers() {
 func doCleanup(queue, repeatQueue *netfilter.Queue) {
 	log.Info("Cleaning up ...")
 	firewall.Stop(&queueNum)
-	procmon.End()
+	monitor.End()
 	uiClient.Close()
 	queue.Close()
 	repeatQueue.Close()
@@ -389,7 +390,7 @@ func main() {
 		procmon.SetMonitorMethod(procmonMethod)
 		fmt.Println("procmonMethod", procmonMethod)
 	}
-	procmon.Init()
+	monitor.Init()
 
 	// queue is ready, run firewall rules
 	firewall.Init(&queueNum)
