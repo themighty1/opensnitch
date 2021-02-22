@@ -7,8 +7,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -18,8 +16,7 @@ import (
 	"github.com/vishvananda/netlink"
 
 	daemonNetlink "github.com/evilsocket/opensnitch/daemon/netlink"
-	"github.com/iovisor/gobpf/bcc"
-	bpf "github.com/iovisor/gobpf/bcc"
+	elf "github.com/iovisor/gobpf/elf"
 )
 
 //Our goal is to parse each new connection as quickly as possible
@@ -32,7 +29,7 @@ import (
 //That's why we employ 2 maps: odd and even map. The odd map holds the first 5000 unique entries and the even map
 //holds the second 5000 unique entries for each 10000 entries.
 
-//Workflow in ebpf:
+//Workflow in ebpf. (check ebpf_prog/opensnitch.c)
 //When the odd map reaches 4000 entries, the final 1000 entries are put both into the odd map and into the even map.
 //When odd map reached 5000 entries, even map becomes the primary map.
 //Even though even map is now primary, the next 1000 entries (i.e entries from 5001 to 6000)
@@ -51,400 +48,16 @@ import (
 // + 5000 (the actual unique entries)
 // + 1000 (duplicate entries: after we just switched to even map)
 
-import "C"
-
-//based on https://github.com/iovisor/bcc/blob/master/examples/tracing/tcpv4connect.py
-var source string = `
-#include <uapi/linux/ptrace.h>
-#include <net/sock.h>
-#include <net/inet_sock.h>
-#include <bcc/proto.h>
-
-struct tcp_key_t {
-	u16 sport;
-	u32 daddr;
-	u16 dport; 
-}__attribute__((packed));
-
-struct tcp_value_t{
-	u32 pid;
-	u32 saddr;
-	u64 counter; //counters in value are for debug purposes only
-}__attribute__((packed));;
-
-struct tcpv6_key_t {
-	u16 sport;
-	unsigned __int128 daddr;
-	u16 dport; 
-}__attribute__((packed));
-
-struct tcpv6_value_t{
-	u32 pid;
-	unsigned __int128 saddr;
-	u64 counter; //counters in value are for debug purposes only
-}__attribute__((packed));;
-
-struct udp_key_t {
-	u16 sport;
-	u32 daddr;
-	u16 dport; 
-} __attribute__((packed));
-
-struct udp_value_t{
-	u32 pid;
-	u32 saddr;
-	u64 counter; //counters in value are for debug purposes only
-}__attribute__((packed));
-
-struct udpv6_key_t {
-	u16 sport;
-	unsigned __int128 daddr;
-	u16 dport; 
-}__attribute__((packed));
-
-struct udpv6_value_t{
-	u32 pid;
-	unsigned __int128 saddr;
-	u64 counter; //counters in value are for debug purposes only
-}__attribute__((packed));
-
-struct tcpv6sock_value_t {
-	struct sock *sk;
-	struct sockaddr *uaddr;
-};
-
-
-BPF_HASH(udpMapOdd, struct udp_key_t, struct udp_value_t, MAPSIZE+MAPCACHESIZE*2);
-BPF_HASH(udpMapEven, struct udp_key_t, struct udp_value_t, MAPSIZE+MAPCACHESIZE*2);
-
-BPF_HASH(udpv6MapOdd, struct udpv6_key_t, struct udpv6_value_t, MAPSIZE+MAPCACHESIZE*2);
-BPF_HASH(udpv6MapEven, struct udpv6_key_t, struct udpv6_value_t, MAPSIZE+MAPCACHESIZE*2);
-
-BPF_HASH(tcpMapOdd, struct tcp_key_t, struct tcp_value_t, MAPSIZE+MAPCACHESIZE*2);  
-BPF_HASH(tcpMapEven, struct tcp_key_t, struct tcp_value_t, MAPSIZE+MAPCACHESIZE*2);
-
-BPF_HASH(tcpv6MapOdd, struct tcpv6_key_t, struct tcpv6_value_t, MAPSIZE+MAPCACHESIZE*2);
-BPF_HASH(tcpv6MapEven, struct tcpv6_key_t, struct tcpv6_value_t, MAPSIZE+MAPCACHESIZE*2);
-
-//for TCP the IP-tuple will be known only upon return, so we stash the socket here to 
-//look it up upon return 
-BPF_HASH(tcpsock, u32, struct sock *, 100);
-BPF_HASH(tcpv6sock, u32, struct tcpv6sock_value_t, 100);
-
-//counts how many connections we've processed. Starts at 0.
-BPF_ARRAY(tcpcounter, u64, 1);
-BPF_ARRAY(tcpv6counter, u64, 1);
-BPF_ARRAY(udpcounter, u64, 1);
-BPF_ARRAY(udpv6counter, u64, 1);
-
-BPF_ARRAY(tcpsendcounter, u64, 1);
-BPF_HASH(tcpsend, struct tcp_key_t, struct tcp_value_t, 100000);
-
-int kprobe__tcp_v4_connect(struct pt_regs *ctx, struct sock *sk)
-{
-	u32 pid = bpf_get_current_pid_tgid();
-	tcpsock.update(&pid, &sk);
-	return 0;
-};
-int kretprobe__tcp_v4_connect(struct pt_regs *ctx)
-{
-	u32 pid = bpf_get_current_pid_tgid();
-	struct sock **skpp = tcpsock.lookup(&pid);
-	if (skpp == NULL) {
-		tcpsendcounter.increment(0);
-		return 0;}
-	struct sock *skp = *skpp;
-	
-	struct tcp_key_t tcp_key = {};
-	tcp_key.dport = skp->__sk_common.skc_dport;
-	tcp_key.sport = inet_sk(skp)->inet_sport;
-	tcp_key.daddr = skp->__sk_common.skc_daddr;
-
-	struct tcp_value_t tcp_value = {};
-	tcp_value.pid = pid;
-	tcp_value.saddr = skp->__sk_common.skc_rcv_saddr;
-	
-	int zero_key = 0;
-	u64 *val = tcpcounter.lookup(&zero_key);
-	if (val == NULL){return 0;}
-	tcp_value.counter = *val;
-
-	//we need to decide into which map this connection goes
-	u32 modulo = *val % (MAPSIZE*2);  
-	if (modulo < MAPSIZE){ //from 0 to 4999 goes into odd map
-		tcpMapOdd.update(&tcp_key, &tcp_value);
-		if (modulo >= (MAPSIZE-MAPCACHESIZE) || modulo < MAPCACHESIZE){
-			//mirror the first and the last MAPCACHESIZE entries in another map
-			struct tcp_key_t tcp_key2 = {};
-			tcp_key2.dport = skp->__sk_common.skc_dport;
-			tcp_key2.sport = inet_sk(skp)->inet_sport;
-			tcp_key2.daddr = skp->__sk_common.skc_daddr;
-
-			struct tcp_value_t tcp_value2 = {};
-			tcp_value2.pid = pid;
-			tcp_value2.saddr = skp->__sk_common.skc_rcv_saddr;
-			tcp_value2.counter = *val;
-
-			tcpMapEven.update(&tcp_key2, &tcp_value2);
-		}
-	}
-	else {
-		tcpMapEven.update(&tcp_key, &tcp_value);
-		if (modulo >= (MAPSIZE*2-MAPCACHESIZE) || modulo < (MAPSIZE+MAPCACHESIZE) ){
-			//mirror the the first and last MAPCACHESIZE entries in another map
-			struct tcp_key_t tcp_key2 = {};
-			tcp_key2.dport = skp->__sk_common.skc_dport;
-			tcp_key2.sport = inet_sk(skp)->inet_sport;
-			tcp_key2.daddr = skp->__sk_common.skc_daddr;
-
-			struct tcp_value_t tcp_value2 = {};
-			tcp_value2.pid = pid;
-			tcp_value2.saddr = skp->__sk_common.skc_rcv_saddr;
-			tcp_value2.counter = *val;
-
-			tcpMapOdd.update(&tcp_key2, &tcp_value2);
-		}
-	}
-
-	tcpcounter.increment(0);
-	tcpsock.delete(&pid);
-	return 0;
-};
-
-
-int kprobe__tcp_v6_connect(struct pt_regs *ctx, struct sock *sk, struct sockaddr *uaddr)
-{
-	u32 pid = bpf_get_current_pid_tgid();
-	struct tcpv6sock_value_t tcpv6sock_value = {};
-	tcpv6sock_value.sk = sk;
-	tcpv6sock_value.uaddr = uaddr;
-	tcpv6sock.update(&pid, &tcpv6sock_value);
-	return 0;
-};
-int kretprobe__tcp_v6_connect(struct pt_regs *ctx)
-{
-	u32 pid = bpf_get_current_pid_tgid();
-
-	struct tcpv6sock_value_t *tcpv6sock_value = tcpv6sock.lookup(&pid);
-	if (tcpv6sock_value == NULL) {return 0;}
-	struct sock *sk = tcpv6sock_value->sk;
-	struct sockaddr *uaddr = tcpv6sock_value->uaddr;
-	struct sockaddr_in6 *usin = (struct sockaddr_in6 *) uaddr;
-	
-	struct tcpv6_key_t tcpv6_key = {};
-	tcpv6_key.dport = sk->__sk_common.skc_dport;
-	tcpv6_key.sport = inet_sk(sk)->inet_sport;
-	bpf_probe_read(&tcpv6_key.daddr, sizeof(tcpv6_key.daddr),
-		sk->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
-
-	struct tcpv6_value_t tcpv6_value = {};
-	tcpv6_value.pid = pid;
-	bpf_probe_read(&tcpv6_value.saddr, sizeof(tcpv6_value.saddr), 
-	sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
-
-	int zero_key = 0;
-	u64 *val = tcpv6counter.lookup(&zero_key);
-	if (val == NULL){return 0;}
-	tcpv6_value.counter = *val;
-
-	u32 modulo = *val % (MAPSIZE*2);  
-	if (modulo < MAPSIZE){
-		tcpv6MapOdd.update(&tcpv6_key, &tcpv6_value);
-		if (modulo >= (MAPSIZE-MAPCACHESIZE) || modulo < MAPCACHESIZE){
-			tcpv6MapEven.update(&tcpv6_key, &tcpv6_value);
-		}
-	}
-	else {
-		tcpv6MapEven.update(&tcpv6_key, &tcpv6_value);
-		if (modulo >= (MAPSIZE*2-MAPCACHESIZE) || modulo < (MAPSIZE+MAPCACHESIZE)){
-			//mirror the last MAPCACHESIZE entries in another map
-			tcpv6MapOdd.update(&tcpv6_key, &tcpv6_value);
-		}
-	}
-	
-	tcpv6counter.increment(0);
-	tcpv6sock.delete(&pid);
-	return 0;
-};
-
-
-int kprobe__udp_sendmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg, size_t len)
-{
-	u32 pid = bpf_get_current_pid_tgid();
-	struct flowi4 *fl4 = &(inet_sk(sk)->cork.fl.u.ip4);
-	struct sockaddr_in * usin = (struct sockaddr_in *)msg->msg_name;
-
-	struct udp_key_t udp_key = {};
-	udp_key.dport = sk->__sk_common.skc_dport;
-	if (udp_key.dport == 0){
-		udp_key.dport = usin->sin_port;
-		udp_key.daddr = usin->sin_addr.s_addr;
-	}
-	else {
-		udp_key.daddr = sk->__sk_common.skc_daddr;
-	}
-
-	udp_key.sport = sk->__sk_common.skc_num;
-	u32 saddr = sk->__sk_common.skc_rcv_saddr;
-	if (saddr == 0) {
-		saddr = inet_sk(sk)->inet_saddr;
-		if (saddr == 0) {
-			saddr = inet_sk(sk)->cork.fl.u.ip4.saddr;
-			if (saddr == 0){
-				if (sk->sk_state != TCP_CLOSE) {
-					//if a UDP socket is listening on all interfaces 0.0.0.0,
-					//its state must be 7 , (called TCP_CLOSE, although nothing to do with TCP)
-					return 0;
-				}
-			}
-		}
-	}
-
-	int zero_key = 0;
-	u64 *counterVal = udpcounter.lookup(&zero_key);
-	if (counterVal == NULL){return 0;}
-	u32 modulo = *counterVal % (MAPSIZE*2);  
-	bool oddMap = (modulo < MAPSIZE) ? true : false;
-
-	struct udp_value_t *lookedupValue = oddMap ? udpMapOdd.lookup(&udp_key) : udpMapEven.lookup(&udp_key);
-	if ( lookedupValue == NULL || lookedupValue->pid != pid) {
-		struct udp_value_t udp_value = {};
-		udp_value.pid = pid;
-		udp_value.saddr = saddr;
-		udp_value.counter = *counterVal;
-
-		if (oddMap){
-			udpMapOdd.update(&udp_key, &udp_value);
-			if (modulo >= (MAPSIZE-MAPCACHESIZE) || modulo < MAPCACHESIZE){
-				//mirror the last 1000 entries in another map
-				udpMapEven.update(&udp_key, &udp_value);
-			}
-		}
-		else {
-			udpMapEven.update(&udp_key, &udp_value);
-			if (modulo >= (MAPSIZE*2-MAPCACHESIZE) || modulo < (MAPSIZE+MAPCACHESIZE)){
-				//mirror the last 1000 entries in another map
-				udpMapOdd.update(&udp_key, &udp_value);
-			}
-		}
-		udpcounter.increment(0);
-	}
-	//else nothing to do
-	return 0;
-
-};
-
-int kprobe__udpv6_sendmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg, size_t len)
-{	
-	u32 pid = bpf_get_current_pid_tgid();
-	struct sockaddr_in6 * usin = (struct sockaddr_in6 *)msg->msg_name;
-
-	struct udpv6_key_t udpv6_key = {};
-
-	udpv6_key.sport = sk->__sk_common.skc_num;
-
-	udpv6_key.dport = sk->__sk_common.skc_dport;
-	if (udpv6_key.dport == 0){
-		struct sockaddr_in6 * sin6 = (struct sockaddr_in6 *)msg->msg_name;
-		udpv6_key.dport = sin6->sin6_port;
-		bpf_probe_read(&udpv6_key.daddr, sizeof(udpv6_key.daddr),
-			sin6->sin6_addr.in6_u.u6_addr32);
-	}
-	else {
-		bpf_probe_read(&udpv6_key.daddr, sizeof(udpv6_key.daddr),
-			sk->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
-	}
-
-	unsigned __int128 saddr;
-	bpf_probe_read(&saddr, sizeof(saddr), 
-		sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
-	if (saddr == 0){
-		if (sk->sk_state != TCP_CLOSE) {
-			//if a UDP socket is listening on all interfaces 0.0.0.0,
-			//it's state must be 7 , (called TCP_CLOSE, although nothing to do with TCP)
-			return 0;
-		}
-	}
-
-	int zero_key = 0;
-	u64 *counterVal = udpv6counter.lookup(&zero_key);
-	if (counterVal == NULL){return 0;}
-	u32 modulo = *counterVal % (MAPSIZE*2);  
-	bool oddMap = (*counterVal % (MAPSIZE*2) <= MAPSIZE) ? true : false;
-
-	struct udpv6_value_t *lookedupValue = oddMap ? udpv6MapOdd.lookup(&udpv6_key) : udpv6MapEven.lookup(&udpv6_key);
-	if ( lookedupValue == NULL || lookedupValue->pid != pid) {
-		struct udpv6_value_t udpv6_value = {};
-		udpv6_value.pid = pid;
-		udpv6_value.saddr = saddr;
-		udpv6_value.counter = *counterVal;
-
-		if (oddMap){
-			udpv6MapOdd.update(&udpv6_key, &udpv6_value);
-			if (modulo >= (MAPSIZE-MAPCACHESIZE) || modulo < MAPCACHESIZE){
-				//mirror the last 1000 entries in another map
-				udpv6MapEven.update(&udpv6_key, &udpv6_value);
-			}
-		}
-		else {
-			udpv6MapEven.update(&udpv6_key, &udpv6_value);
-			if (modulo >= (MAPSIZE*2-MAPCACHESIZE) || modulo < (MAPSIZE+MAPCACHESIZE)){
-				//mirror the last 1000 entries in another map
-				udpv6MapOdd.update(&udpv6_key, &udpv6_value);
-			}
-		}
-		udpv6counter.increment(0);
-	}
-	//else nothing to do
-	return 0;
-	
-};
-
-int kprobe__tcp_sendmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg){
-	u32 pid = bpf_get_current_pid_tgid();
-	struct sockaddr_in * usin = (struct sockaddr_in *)msg->msg_name;
-
-	struct tcp_key_t tcp_key = {};
-	u16 dport = sk->__sk_common.skc_dport;
-	u32 daddr;
-	if (dport == 0){	
-		tcp_key.dport = usin->sin_port;
-		tcp_key.daddr = usin->sin_addr.s_addr;
-	} else {
-		tcp_key.dport = dport;
-		tcp_key.daddr = sk->__sk_common.skc_daddr;
-	}
-	
-	u16 sport = inet_sk(sk)->inet_sport;
-	if (sport == 0) {
-		sport = sk->__sk_common.skc_num;
-	}
-	tcp_key.sport = sport; 
-
-	struct tcp_value_t tcp_value = {};
-	tcp_value.pid = pid;
-	tcp_value.saddr = sk->__sk_common.skc_rcv_saddr;
-
-	int zero_key = 0;
-	u64 *counterVal = tcpsendcounter.lookup(&zero_key);
-	if (counterVal == NULL){return 0;}
-	tcp_value.counter = *counterVal; 
-	
-	tcpsend.update(&tcp_key, &tcp_value);
-	tcpsendcounter.increment(0);
-	return 0;
-}
-
-`
-
 //contains pointers to all ebpf maps (also called tables) for a given protocol (tcp/udp/v6)
 type ebpfMapsForProto struct {
 	sync.Mutex
-	counter, mapEven, mapOdd *bcc.Table
-	mapOddFd, mapEvenFd      uint64 //ebpf map file descriptor
-	isOddInUse               bool
-	waitingToPurgeOdd        bool
-	waitingToPurgeEven       bool
+	counterMap          *elf.Map
+	mapEven             *elf.Map
+	mapOdd              *elf.Map
+	mapOddFd, mapEvenFd uint64 //ebpf map file descriptor
+	isOddInUse          bool
+	waitingToPurgeOdd   bool
+	waitingToPurgeEven  bool
 }
 
 func (e *ebpfMapsForProto) getIsOddInUse() bool {
@@ -476,8 +89,8 @@ type lookup_valuev6_t struct {
 }
 
 var (
-	m       *bpf.Module
-	mapSize = 500000
+	m       *elf.Module
+	mapSize = 50000
 	// mapCacheSize is the size of the cache we build to make a smooth
 	// switch from odd<->even maps
 	mapCacheSize            = 10000
@@ -485,8 +98,6 @@ var (
 	alreadyEstablishedTCP   = make(map[*daemonNetlink.Socket]int)
 	alreadyEstablishedTCPv6 = make(map[*daemonNetlink.Socket]int)
 	stop                    = false
-	tcpMapFd                int
-	udpMapFd                int
 	bpf_lookup_elem         bpf_lookup_elem_t
 	bpf_lookup_elemv6       bpf_lookup_elem_t
 	lookupKey               = make([]byte, 8)
@@ -499,92 +110,70 @@ var (
 
 //Start installs ebpf kprobes
 func Start() error {
-	source = strings.ReplaceAll(source, "MAPSIZE", strconv.Itoa(mapSize))
-	source = strings.ReplaceAll(source, "MAPCACHESIZE", strconv.Itoa(mapCacheSize))
+	m = elf.NewModule("opensnitch.o")
+	if err := m.Load(nil); err != nil {
+		panic(err)
+	}
 
-	m = bpf.NewModule(source, []string{})
-	tcpcounter := bpf.NewTable(m.TableId("tcpcounter"), m)
-	tcpv6counter := bpf.NewTable(m.TableId("tcpv6counter"), m)
-	udpcounter := bpf.NewTable(m.TableId("udpcounter"), m)
-	udpv6counter := bpf.NewTable(m.TableId("udpv6counter"), m)
-	tcpsendcounter := bpf.NewTable(m.TableId("tcpsendcounter"), m)
-
-	for _, table := range []*bcc.Table{tcpcounter, tcpv6counter, udpcounter, udpv6counter, tcpsendcounter} {
-		zeroKey := make([]byte, 4)
-		zeroValue := make([]byte, 8)
-		if err := table.Set(zeroKey, zeroValue); err != nil {
-			fmt.Println("error in counterTable.Set", err)
-			return err
+	for _, name := range []string{
+		"kprobe/tcp_v4_connect",
+		"kretprobe/tcp_v4_connect",
+		"kprobe/tcp_v6_connect",
+		"kretprobe/tcp_v6_connect",
+		"kprobe/udp_sendmsg",
+		"kprobe/udpv6_sendmsg"} {
+		err := m.EnableKprobe(name, 0)
+		if err != nil {
+			fmt.Println(name)
+			m.Close()
+			panic(err)
 		}
 	}
 
-	tcpMapOdd := bpf.NewTable(m.TableId("tcpMapOdd"), m)
-	tcpMapEven := bpf.NewTable(m.TableId("tcpMapEven"), m)
-	udpMapOdd := bpf.NewTable(m.TableId("udpMapOdd"), m)
-	udpMapEven := bpf.NewTable(m.TableId("udpMapEven"), m)
-	tcpv6MapOdd := bpf.NewTable(m.TableId("tcpv6MapOdd"), m)
-	tcpv6MapEven := bpf.NewTable(m.TableId("tcpv6MapEven"), m)
-	udpv6MapOdd := bpf.NewTable(m.TableId("udpv6MapOdd"), m)
-	udpv6MapEven := bpf.NewTable(m.TableId("udpv6MapEven"), m)
+	// init counters to 0
+	zeroKey := make([]byte, 4)
+	zeroValue := make([]byte, 8)
+	for _, name := range []string{"tcpcounter", "tcpv6counter", "udpcounter", "udpv6counter"} {
+		err := m.UpdateElement(m.Map(name), unsafe.Pointer(&zeroKey[0]), unsafe.Pointer(&zeroValue[0]), 0)
+		if err != nil {
+			panic(err)
+		}
+	}
 
-	tcpMapOddFd := (uint64)(tcpMapOdd.Config()["fd"].(int))
-	tcpMapEvenFd := (uint64)(tcpMapEven.Config()["fd"].(int))
-	udpMapOddFd := (uint64)(udpMapOdd.Config()["fd"].(int))
-	udpMapEvenFd := (uint64)(udpMapEven.Config()["fd"].(int))
-	tcpv6MapOddFd := (uint64)(tcpv6MapOdd.Config()["fd"].(int))
-	tcpv6MapEvenFd := (uint64)(tcpv6MapEven.Config()["fd"].(int))
-	udpv6MapOddFd := (uint64)(udpv6MapOdd.Config()["fd"].(int))
-	udpv6MapEvenFd := (uint64)(udpv6MapEven.Config()["fd"].(int))
-
+	// prepare struct for bpf() syscall
 	bpf_lookup_elem.key = uintptr(unsafe.Pointer(&lookupKey[0]))
 	bpf_lookup_elem.value = uintptr(unsafe.Pointer(&lookupValue))
 	bpf_lookup_elemv6.key = uintptr(unsafe.Pointer(&lookupKeyv6[0]))
 	bpf_lookup_elemv6.value = uintptr(unsafe.Pointer(&lookupValuev6))
 
 	ebpfMaps = map[string]*ebpfMapsForProto{
-		"tcp": {mapEven: tcpMapEven, mapOdd: tcpMapOdd, counter: tcpcounter,
-			mapOddFd: tcpMapOddFd, mapEvenFd: tcpMapEvenFd,
-			isOddInUse: true, waitingToPurgeOdd: false, waitingToPurgeEven: true},
-		"tcp6": {mapEven: tcpv6MapEven, mapOdd: tcpv6MapOdd, counter: tcpv6counter,
-			mapOddFd: tcpv6MapOddFd, mapEvenFd: tcpv6MapEvenFd,
-			isOddInUse: true, waitingToPurgeOdd: false, waitingToPurgeEven: true},
-		"udp": {mapEven: udpMapEven, mapOdd: udpMapOdd, counter: udpcounter,
-			mapOddFd: udpMapOddFd, mapEvenFd: udpMapEvenFd,
-			isOddInUse: true, waitingToPurgeOdd: false, waitingToPurgeEven: true},
-		"udp6": {mapEven: udpv6MapEven, mapOdd: udpv6MapOdd, counter: udpv6counter,
-			mapOddFd: udpv6MapOddFd, mapEvenFd: udpv6MapEvenFd,
-			isOddInUse: true, waitingToPurgeOdd: false, waitingToPurgeEven: true},
+		"tcp": {isOddInUse: true, waitingToPurgeOdd: false, waitingToPurgeEven: true,
+			counterMap: m.Map("tcpcounter"),
+			mapOdd:     m.Map("tcpMapOdd"),
+			mapEven:    m.Map("tcpMapEven"),
+			mapOddFd:   uint64(m.Map("tcpMapOdd").Fd()),
+			mapEvenFd:  uint64(m.Map("tcpMapEven").Fd())},
+		"tcp6": {isOddInUse: true, waitingToPurgeOdd: false, waitingToPurgeEven: true,
+			counterMap: m.Map("tcpv6counter"),
+			mapOdd:     m.Map("tcpv6MapOdd"),
+			mapEven:    m.Map("tcpv6MapEven"),
+			mapOddFd:   uint64(m.Map("tcpv6MapOdd").Fd()),
+			mapEvenFd:  uint64(m.Map("tcpv6MapEven").Fd())},
+		"udp": {isOddInUse: true, waitingToPurgeOdd: false, waitingToPurgeEven: true,
+			counterMap: m.Map("udpcounter"),
+			mapOdd:     m.Map("udpMapOdd"),
+			mapEven:    m.Map("udpMapEven"),
+			mapOddFd:   uint64(m.Map("udpMapOdd").Fd()),
+			mapEvenFd:  uint64(m.Map("udpMapEven").Fd())},
+		"udp6": {isOddInUse: true, waitingToPurgeOdd: false, waitingToPurgeEven: true,
+			counterMap: m.Map("udpv6counter"),
+			mapOdd:     m.Map("udpv6MapOdd"),
+			mapEven:    m.Map("udpv6MapEven"),
+			mapOddFd:   uint64(m.Map("udpv6MapOdd").Fd()),
+			mapEvenFd:  uint64(m.Map("udpv6MapEven").Fd())},
 	}
 
-	for _, name := range []string{"tcp_v4_connect", "tcp_v6_connect", "udp_sendmsg", "udpv6_sendmsg", "tcp_sendmsg"} {
-		probe, err := m.LoadKprobe(fmt.Sprintf("kprobe__%s", name))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to load kprobe__%s: %s\n", name, err)
-			return err
-		}
-		// passing -1 for maxActive signifies to use the default
-		// according to the kernel kprobes documentation
-		err = m.AttachKprobe(name, probe, -1)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to attach kprobe__%s: %s\n", name, err)
-			return err
-		}
-		if name == "udp_sendmsg" || name == "udpv6_sendmsg" || name == "tcp_sendmsg" {
-			continue
-		}
-		//attach kretprobes for tcp_v4_connect and tcp_v6_connect
-		probe, err = m.LoadKprobe(fmt.Sprintf("kretprobe__%s", name))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to load kretprobe__%s: %s\n", name, err)
-			return err
-		}
-		err = m.AttachKretprobe(name, probe, -1)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to attach kretprobe__%s: %s\n", name, err)
-			return err
-		}
-	}
-
+	// save already established connections
 	socketListTCP, err := daemonNetlink.SocketsDump(uint8(syscall.AF_INET), uint8(syscall.IPPROTO_TCP))
 	if err != nil {
 		fmt.Println("error in SocketsDump")
@@ -615,12 +204,53 @@ func Start() error {
 	go monitorAndSwitchMaps()
 	go monitorLocalAddresses()
 	go monitorAlreadyEstablished()
-
 	return nil
 }
 
 func Stop() {
 	stop = true
+	m.Close()
+}
+
+// delete all elements in a map
+func deleteAllElements(bpfmap *elf.Map, isIPv6 bool) {
+	var lookupKey []byte
+	var nextKey []byte
+	var value []byte
+	if !isIPv6 {
+		lookupKey = make([]byte, 8)
+		nextKey = make([]byte, 8)
+		value = make([]byte, 16)
+	} else {
+		lookupKey = make([]byte, 20)
+		nextKey = make([]byte, 20)
+		value = make([]byte, 28)
+	}
+	firstrun := true
+	fmt.Println("start deleting map")
+	for {
+		ok, err := m.LookupNextElement(bpfmap, unsafe.Pointer(&lookupKey[0]),
+			unsafe.Pointer(&nextKey[0]), unsafe.Pointer(&value[0]))
+		if err != nil {
+			fmt.Println("LookupNextElement error", err)
+			os.Exit(1)
+		}
+		if firstrun {
+			// on first run lookupKey is a dummy, nothing to delete
+			firstrun = false
+			copy(lookupKey, nextKey)
+			continue
+		}
+		if err := m.DeleteElement(bpfmap, unsafe.Pointer(&lookupKey[0])); err != nil {
+			fmt.Println("DeleteElement error", err)
+			os.Exit(1)
+		}
+		if !ok { //reached end of map
+			break
+		}
+		copy(lookupKey, nextKey)
+	}
+	fmt.Println("finished deleting map")
 }
 
 //we need to manually remove old connections from a bpf map
@@ -633,14 +263,13 @@ func monitorAndSwitchMaps() {
 		if stop {
 			return
 		}
-		for _, ebpfMap := range ebpfMaps {
-			v, err := ebpfMap.counter.Get(zeroKey)
-			if err != nil {
-				fmt.Println("error in hashmap.counter.Get(zeroKey)", err)
-				continue
+		for name, ebpfMap := range ebpfMaps {
+			value := make([]byte, 8)
+			if err := m.LookupElement(ebpfMap.counterMap,
+				unsafe.Pointer(&zeroKey[0]), unsafe.Pointer(&value[0])); err != nil {
+				fmt.Println("elfmod.LookupElement(elftcpcounter, ", err)
 			}
-			counterValue := binary.LittleEndian.Uint64(v)
-			//fmt.Println("counterValue", counterValue)
+			counterValue := binary.LittleEndian.Uint64(value)
 			modulo := counterValue % uint64(mapSize*2)
 
 			if !ebpfMap.isOddInUse && modulo < uint64(mapSize) {
@@ -650,10 +279,7 @@ func monitorAndSwitchMaps() {
 				ebpfMap.Unlock()
 			}
 			if ebpfMap.waitingToPurgeEven && modulo >= uint64(mapCacheSize) {
-				err = ebpfMap.mapEven.DeleteAll()
-				if err != nil {
-					fmt.Println("error in hashmap.id.Delete", err)
-				}
+				deleteAllElements(ebpfMap.mapEven, name == "tcp6" || name == "udp6")
 				ebpfMap.Lock()
 				ebpfMap.waitingToPurgeEven = false
 				ebpfMap.Unlock()
@@ -665,10 +291,7 @@ func monitorAndSwitchMaps() {
 				ebpfMap.Unlock()
 			}
 			if ebpfMap.waitingToPurgeOdd && modulo >= uint64(mapSize+mapCacheSize) {
-				err = ebpfMap.mapOdd.DeleteAll()
-				if err != nil {
-					fmt.Println("error in hashmap.id.Delete", err)
-				}
+				deleteAllElements(ebpfMap.mapOdd, name == "tcp6" || name == "udp6")
 				ebpfMap.Lock()
 				ebpfMap.waitingToPurgeOdd = false
 				ebpfMap.Unlock()
@@ -704,9 +327,9 @@ func GetPid(proto string, srcPort uint, srcIP net.IP, dstIP net.IP, dstPort uint
 
 	ebpfMap := ebpfMaps[proto]
 	if (*ebpfMap).getIsOddInUse() {
-		bpf_lookup.map_fd = (*ebpfMap).mapOddFd
+		bpf_lookup.map_fd = ebpfMap.mapOddFd
 	} else {
-		bpf_lookup.map_fd = (*ebpfMap).mapEvenFd
+		bpf_lookup.map_fd = ebpfMap.mapEvenFd
 	}
 
 	BPF_MAP_LOOKUP_ELEM := 1 //cmd number
@@ -864,15 +487,16 @@ func monitorAlreadyEstablished() {
 //PrintEverything prints all the stats
 func PrintEverything(suffix string) {
 	bash, _ := exec.LookPath("bash")
+	fmt.Println("tcpoddfd is", ebpfMaps["tcp"].mapOddFd)
 	cmd := exec.Command(bash, "-c", "bpftool map dump name tcpMapOdd > mapoddHi"+suffix)
 	if err := cmd.Run(); err != nil {
-		fmt.Println("Error running go test -c", err)
+		fmt.Println("bpftool map dump name tcpMapOdd ", err)
 	}
 
 	bash, _ = exec.LookPath("bash")
 	cmd = exec.Command(bash, "-c", "bpftool map dump name tcpMapEven > mapEvenHi"+suffix)
 	if err := cmd.Run(); err != nil {
-		fmt.Println("Error running go test -c", err)
+		fmt.Println("bpftool map dump name tcpMapEven", err)
 	}
 
 	for sock1, v := range alreadyEstablishedTCP {

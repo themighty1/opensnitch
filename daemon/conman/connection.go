@@ -150,7 +150,7 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (
 
 	FoundPid:
 		stats = append(stats, time.Since(start).String())
-		fmt.Printf("took time to find match %v \n", time.Since(start))
+		//fmt.Printf("took time to find match %v \n", time.Since(start))
 		if c.Process = procmon.FindProcess(pid, showUnknownCons); c.Process == nil {
 			fmt.Printf("Could not find process by its pid %d for: %s", pid, c)
 			return nil, fmt.Errorf("Could not find process by its pid %d for: %s", pid, c)
@@ -158,7 +158,9 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (
 		//fmt.Printf("took time to find process by pid %v \n", time.Since(start))
 		if loops > 15 {
 			for _, v := range stats {
-				fmt.Println(v)
+				if false {
+					fmt.Println(v)
+				}
 			}
 			loops = 0
 			stats = nil

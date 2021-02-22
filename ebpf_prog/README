@@ -1,0 +1,22 @@
+opensnitch.c is an eBPF program. Compilation requires getting kernel source.
+
+cd opensnitch
+wget https://github.com/torvalds/linux/archive/v5.8.tar.gz
+tar -xf v5.8.tar.gz
+patch linux-5.8/tools/lib/bpf/bpf_helpers.h < ebpf_prog/file.patch
+cp ebpf_prog/opensnitch.c ebpf_prog/Makefile linux-5.8/samples/bpf
+cd linux-5.8 && yes "" | make oldconfig && make prepare && make headers_install # (1 min)
+cd samples/bpf && make
+objdump -h opensnitch.o #you should see many section, number 1 should be called kprobe/tcp_v4_connect
+llvm-strip -g opensnitch.o #remove debug info
+cp opensnitch.o ../../../daemon/
+cd ../../../daemon
+
+--opensnitchd expects to find opensnitch.o in current working dir
+--start opensnitchd with:
+
+opensnitchd -rules-path /etc/opensnitchd/rules -process-monitor-method ebpf
+
+--you may get an error 
+--cannot write "p:ptcp_v4_connect tcp_v4_connect\n" to kprobe_events: write /sys/kernel/debug/tracing/kprobe_events: file exists
+--in this case just try to run again
