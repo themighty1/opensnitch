@@ -19,51 +19,12 @@ import (
 	elf "github.com/iovisor/gobpf/elf"
 )
 
-//Our goal is to parse each new connection as quickly as possible
-//that's why we don't use BPF_PERF_OUTPUT but maintain the maps inside ebpf.
-//With BPF_PERF_OUTPUT processing time is ~50us whereas with the current method it is ~20us.
-
-//a key/value map size must be indicated in advance when ebpf program starts. Normally as map grows full, we'd want
-//to delete older entries from it. However, deleting one entry at a time is an expensive operation in ebpf, in
-//contrast to deleting all entries of a map - which is cheap.
-//That's why we employ 2 maps: odd and even map. The odd map holds the first 5000 unique entries and the even map
-//holds the second 5000 unique entries for each 10000 entries.
-
-//Workflow in ebpf. (check ebpf_prog/opensnitch.c)
-//When the odd map reaches 4000 entries, the final 1000 entries are put both into the odd map and into the even map.
-//When odd map reached 5000 entries, even map becomes the primary map.
-//Even though even map is now primary, the next 1000 entries (i.e entries from 5001 to 6000)
-//are put both into even map and into odd map.
-
-//Workflow in userspace:
-//When func monitorAndSwitchMaps() detects that odd map has >= 5000 entries, all future PID lookups will happen in even map.
-//This detection doesn't happen exactly at 5000 mark but whenever monitorAndSwitchMaps() makes its next iteration.
-//For this reason ebpf copies the first 1000 entries of even map into the odd map.
-//monitorAndSwitchMaps() waits until odd map has 6000 entries and then deletes it.
-
-//the same workflow applies for even map.
-
-//Thus the capacity for each map must be 7000, viz. (in case of odd map)
-//   1000 (duplicate entries: when even map is still the main map and we're about to switch to odd map)
-// + 5000 (the actual unique entries)
-// + 1000 (duplicate entries: after we just switched to even map)
-
-//contains pointers to all ebpf maps (also called tables) for a given protocol (tcp/udp/v6)
+//contains pointers to ebpf maps (also called tables) for a given protocol (tcp/udp/v6)
 type ebpfMapsForProto struct {
-	sync.Mutex
-	counterMap          *elf.Map
-	mapEven             *elf.Map
-	mapOdd              *elf.Map
-	mapOddFd, mapEvenFd uint64 //ebpf map file descriptor
-	isOddInUse          bool
-	waitingToPurgeOdd   bool
-	waitingToPurgeEven  bool
-}
-
-func (e *ebpfMapsForProto) getIsOddInUse() bool {
-	e.Lock()
-	defer e.Unlock()
-	return e.isOddInUse
+	counterMap    *elf.Map
+	bpfmap        *elf.Map
+	bpfmapFd      uint64 // ebpf map file descriptor
+	lastPurgedMax uint64 // max counter value up to and including which the map was purged on the last purge
 }
 
 //mimics union bpf_attr's anonymous struct used by BPF_MAP_*_ELEM commands
@@ -89,11 +50,8 @@ type lookup_valuev6_t struct {
 }
 
 var (
-	m       *elf.Module
-	mapSize = 50000
-	// mapCacheSize is the size of the cache we build to make a smooth
-	// switch from odd<->even maps
-	mapCacheSize            = 10000
+	m                       *elf.Module
+	mapSize                 = 25000
 	ebpfMaps                map[string]*ebpfMapsForProto
 	alreadyEstablishedTCP   = make(map[*daemonNetlink.Socket]int)
 	alreadyEstablishedTCPv6 = make(map[*daemonNetlink.Socket]int)
@@ -147,30 +105,22 @@ func Start() error {
 	bpf_lookup_elemv6.value = uintptr(unsafe.Pointer(&lookupValuev6))
 
 	ebpfMaps = map[string]*ebpfMapsForProto{
-		"tcp": {isOddInUse: true, waitingToPurgeOdd: false, waitingToPurgeEven: true,
+		"tcp": {lastPurgedMax: 0,
 			counterMap: m.Map("tcpcounter"),
-			mapOdd:     m.Map("tcpMapOdd"),
-			mapEven:    m.Map("tcpMapEven"),
-			mapOddFd:   uint64(m.Map("tcpMapOdd").Fd()),
-			mapEvenFd:  uint64(m.Map("tcpMapEven").Fd())},
-		"tcp6": {isOddInUse: true, waitingToPurgeOdd: false, waitingToPurgeEven: true,
+			bpfmap:     m.Map("tcpMap"),
+			bpfmapFd:   uint64(m.Map("tcpMap").Fd())},
+		"tcp6": {lastPurgedMax: 0,
 			counterMap: m.Map("tcpv6counter"),
-			mapOdd:     m.Map("tcpv6MapOdd"),
-			mapEven:    m.Map("tcpv6MapEven"),
-			mapOddFd:   uint64(m.Map("tcpv6MapOdd").Fd()),
-			mapEvenFd:  uint64(m.Map("tcpv6MapEven").Fd())},
-		"udp": {isOddInUse: true, waitingToPurgeOdd: false, waitingToPurgeEven: true,
+			bpfmap:     m.Map("tcpv6Map"),
+			bpfmapFd:   uint64(m.Map("tcpv6Map").Fd())},
+		"udp": {lastPurgedMax: 0,
 			counterMap: m.Map("udpcounter"),
-			mapOdd:     m.Map("udpMapOdd"),
-			mapEven:    m.Map("udpMapEven"),
-			mapOddFd:   uint64(m.Map("udpMapOdd").Fd()),
-			mapEvenFd:  uint64(m.Map("udpMapEven").Fd())},
-		"udp6": {isOddInUse: true, waitingToPurgeOdd: false, waitingToPurgeEven: true,
+			bpfmap:     m.Map("udpMap"),
+			bpfmapFd:   uint64(m.Map("udpMap").Fd())},
+		"udp6": {lastPurgedMax: 0,
 			counterMap: m.Map("udpv6counter"),
-			mapOdd:     m.Map("udpv6MapOdd"),
-			mapEven:    m.Map("udpv6MapEven"),
-			mapOddFd:   uint64(m.Map("udpv6MapOdd").Fd()),
-			mapEvenFd:  uint64(m.Map("udpv6MapEven").Fd())},
+			bpfmap:     m.Map("udpv6Map"),
+			bpfmapFd:   uint64(m.Map("udpv6Map").Fd())},
 	}
 
 	// save already established connections
@@ -201,7 +151,7 @@ func Start() error {
 		alreadyEstablishedTCPv6[sock] = pid
 	}
 
-	go monitorAndSwitchMaps()
+	go monitorMaps()
 	go monitorLocalAddresses()
 	go monitorAlreadyEstablished()
 	return nil
@@ -212,8 +162,8 @@ func Stop() {
 	m.Close()
 }
 
-// delete all elements in a map
-func deleteAllElements(bpfmap *elf.Map, isIPv6 bool) {
+// delete all elements whose counter value is <=  maxToDelete
+func deleteElements(bpfmap *elf.Map, isIPv6 bool, maxToDelete uint64) {
 	var lookupKey []byte
 	var nextKey []byte
 	var value []byte
@@ -227,8 +177,16 @@ func deleteAllElements(bpfmap *elf.Map, isIPv6 bool) {
 		value = make([]byte, 28)
 	}
 	firstrun := true
-	fmt.Println("start deleting map")
+	fmt.Println("start deleting map", maxToDelete)
+	i := 0
 	for {
+		i++
+		if i > 25000 {
+			// TODO find out what causes the endless loop
+			// maybe because bpf prog modified map while le were iterating
+			fmt.Println("breaking because endless loop was detected")
+			break
+		}
 		ok, err := m.LookupNextElement(bpfmap, unsafe.Pointer(&lookupKey[0]),
 			unsafe.Pointer(&nextKey[0]), unsafe.Pointer(&value[0]))
 		if err != nil {
@@ -241,6 +199,14 @@ func deleteAllElements(bpfmap *elf.Map, isIPv6 bool) {
 			copy(lookupKey, nextKey)
 			continue
 		}
+		// last 8 bytes of value is counter value
+		counterValue := binary.LittleEndian.Uint64(value[8:16])
+		fmt.Println("got counter", counterValue)
+		if counterValue > maxToDelete {
+			copy(lookupKey, nextKey)
+			continue
+		}
+
 		if err := m.DeleteElement(bpfmap, unsafe.Pointer(&lookupKey[0])); err != nil {
 			fmt.Println("DeleteElement error", err)
 			os.Exit(1)
@@ -255,8 +221,7 @@ func deleteAllElements(bpfmap *elf.Map, isIPv6 bool) {
 
 //we need to manually remove old connections from a bpf map
 //since a full bpf map doesnt allow any insertions
-//all our bpf maps are of size 10000
-func monitorAndSwitchMaps() {
+func monitorMaps() {
 	zeroKey := make([]byte, 4)
 	for {
 		time.Sleep(time.Second * 1)
@@ -270,31 +235,10 @@ func monitorAndSwitchMaps() {
 				fmt.Println("elfmod.LookupElement(elftcpcounter, ", err)
 			}
 			counterValue := binary.LittleEndian.Uint64(value)
-			modulo := counterValue % uint64(mapSize*2)
-
-			if !ebpfMap.isOddInUse && modulo < uint64(mapSize) {
-				ebpfMap.Lock()
-				ebpfMap.isOddInUse = true
-				ebpfMap.waitingToPurgeEven = true
-				ebpfMap.Unlock()
-			}
-			if ebpfMap.waitingToPurgeEven && modulo >= uint64(mapCacheSize) {
-				deleteAllElements(ebpfMap.mapEven, name == "tcp6" || name == "udp6")
-				ebpfMap.Lock()
-				ebpfMap.waitingToPurgeEven = false
-				ebpfMap.Unlock()
-			}
-			if ebpfMap.isOddInUse && modulo >= uint64(mapSize) {
-				ebpfMap.Lock()
-				ebpfMap.isOddInUse = false
-				ebpfMap.waitingToPurgeOdd = true
-				ebpfMap.Unlock()
-			}
-			if ebpfMap.waitingToPurgeOdd && modulo >= uint64(mapSize+mapCacheSize) {
-				deleteAllElements(ebpfMap.mapOdd, name == "tcp6" || name == "udp6")
-				ebpfMap.Lock()
-				ebpfMap.waitingToPurgeOdd = false
-				ebpfMap.Unlock()
+			fmt.Println("counterValuem, ebpfMap.lastPurgedMax", counterValue, ebpfMap.lastPurgedMax)
+			if counterValue-ebpfMap.lastPurgedMax > 20000 {
+				ebpfMap.lastPurgedMax = counterValue - 10000
+				deleteElements(ebpfMap.bpfmap, name == "tcp6" || name == "udp6", ebpfMap.lastPurgedMax)
 			}
 		}
 	}
@@ -325,13 +269,7 @@ func GetPid(proto string, srcPort uint, srcIP net.IP, dstIP net.IP, dstPort uint
 		binary.LittleEndian.PutUint16((*key)[0:2], uint16(srcPort))
 	}
 
-	ebpfMap := ebpfMaps[proto]
-	if (*ebpfMap).getIsOddInUse() {
-		bpf_lookup.map_fd = ebpfMap.mapOddFd
-	} else {
-		bpf_lookup.map_fd = ebpfMap.mapEvenFd
-	}
-
+	bpf_lookup.map_fd = ebpfMaps[proto].bpfmapFd
 	BPF_MAP_LOOKUP_ELEM := 1 //cmd number
 	syscall_BPF := 321       //syscall number
 	sizeOfStruct := 24       //sizeof bpf_lookup_elem_t struct
@@ -407,7 +345,7 @@ func FindAddressInLocalAddresses(addr net.IP) bool {
 	return false
 }
 
-//maintains a list of this machine's local addresses
+// maintains a list of this machine's local addresses
 func monitorLocalAddresses() {
 	for {
 		addr, err := netlink.AddrList(nil, netlink.FAMILY_ALL)
@@ -487,7 +425,7 @@ func monitorAlreadyEstablished() {
 //PrintEverything prints all the stats
 func PrintEverything(suffix string) {
 	bash, _ := exec.LookPath("bash")
-	fmt.Println("tcpoddfd is", ebpfMaps["tcp"].mapOddFd)
+	fmt.Println("tcpoddfd is", ebpfMaps["tcp"].bpfmapFd)
 	cmd := exec.Command(bash, "-c", "bpftool map dump name tcpMapOdd > mapoddHi"+suffix)
 	if err := cmd.Run(); err != nil {
 		fmt.Println("bpftool map dump name tcpMapOdd ", err)

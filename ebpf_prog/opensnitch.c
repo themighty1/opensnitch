@@ -4,12 +4,11 @@
 #include <linux/version.h>
 #include <uapi/linux/bpf.h>
 #include <bpf/bpf_helpers.h>
-#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_tracing.h> 
 #include <net/sock.h>
 #include <net/inet_sock.h>
 
-#define MAPSIZE 50000
-#define MAPCACHESIZE 10000
+#define MAPSIZE 25000
 
 //-------------------------------map definitions 
 // which github.com/iovisor/gobpf/elf expects
@@ -87,62 +86,33 @@ struct tcpv6sock_value_t {
 };
 
 // Add +1,+2, etc. to max size helps to easier distinguish maps in bpftool's output
-struct bpf_map_def SEC("maps/tcpMapOdd") tcpMapOdd = {
+struct bpf_map_def SEC("maps/tcpMap") tcpMap = {
 	.type = BPF_MAP_TYPE_HASH,
 	.key_size = sizeof(struct tcp_key_t),
 	.value_size = sizeof(struct tcp_value_t),
-	.max_entries = MAPSIZE+MAPCACHESIZE*2+1,
+	.max_entries = MAPSIZE+1,
 };
 
-struct bpf_map_def SEC("maps/tcpMapEven") tcpMapEven = {
-	.type = BPF_MAP_TYPE_HASH,
-	.key_size = sizeof(struct tcp_key_t),
-	.value_size = sizeof(struct tcp_value_t),
-	.max_entries = MAPSIZE+MAPCACHESIZE*2+2,
-};
-
-struct bpf_map_def SEC("maps/tcpv6MapOdd") tcpv6MapOdd = {
+struct bpf_map_def SEC("maps/tcpv6Map") tcpv6Map = {
 	.type = BPF_MAP_TYPE_HASH,
 	.key_size = sizeof(struct tcpv6_key_t),
 	.value_size = sizeof(struct tcpv6_value_t),
-	.max_entries = MAPSIZE+MAPCACHESIZE*2+3,
+	.max_entries = MAPSIZE+2,
 };
 
-struct bpf_map_def SEC("maps/tcpv6MapEven") tcpv6MapEven = {
-	.type = BPF_MAP_TYPE_HASH,
-	.key_size = sizeof(struct tcpv6_key_t),
-	.value_size = sizeof(struct tcpv6_value_t),
-	.max_entries = MAPSIZE+MAPCACHESIZE*2+4,
-};
-
-struct bpf_map_def SEC("maps/udpMapOdd") udpMapOdd = {
+struct bpf_map_def SEC("maps/udpMap") udpMap = {
 	.type = BPF_MAP_TYPE_HASH,
 	.key_size = sizeof(struct udp_key_t),
 	.value_size = sizeof(struct udp_value_t),
-	.max_entries = MAPSIZE+MAPCACHESIZE*2+5,
+	.max_entries = MAPSIZE+3,
 };
 
-struct bpf_map_def SEC("maps/udpMapEven") udpMapEven = {
-	.type = BPF_MAP_TYPE_HASH,
-	.key_size = sizeof(struct udp_key_t),
-	.value_size = sizeof(struct udp_value_t),
-	.max_entries = MAPSIZE+MAPCACHESIZE*2+6,
-};
-
-struct bpf_map_def SEC("maps/udpv6MapOdd") udpv6MapOdd = {
+struct bpf_map_def SEC("maps/udpv6Map") udpv6Map = {
 	.type = BPF_MAP_TYPE_HASH,
 	.key_size = sizeof(struct udpv6_key_t),
 	.value_size = sizeof(struct udpv6_value_t),
-	.max_entries = MAPSIZE+MAPCACHESIZE*2+7,
+	.max_entries = MAPSIZE+4,
 };
-
-struct bpf_map_def SEC("maps/udpv6MapEven") udpv6MapEven = {
-	.type = BPF_MAP_TYPE_HASH,
-	.key_size = sizeof(struct udpv6_key_t),
-	.value_size = sizeof(struct udpv6_value_t),
-	.max_entries = MAPSIZE+MAPCACHESIZE*2+8,
-};
-
 
 
 // //for TCP the IP-tuple will be known only upon return, so we stash the socket here to 
@@ -218,43 +188,7 @@ int kretprobe__tcp_v4_connect(struct pt_regs *ctx)
 	u64 *val = bpf_map_lookup_elem(&tcpcounter, &zero_key);
 	if (val == NULL){return 0;}
 	tcp_value.counter = *val;
-
-	//we need to decide into which map this connection goes
-	u32 modulo = *val % (MAPSIZE*2);  
-	if (modulo < MAPSIZE){ //from 0 to 4999 goes into odd map
-	    bpf_map_update_elem(&tcpMapOdd, &tcp_key, &tcp_value, BPF_ANY);
-		if (modulo >= (MAPSIZE-MAPCACHESIZE) || modulo < MAPCACHESIZE){
-			//mirror the first and the last MAPCACHESIZE entries in another map
-			struct tcp_key_t tcp_key2 = {};
-			tcp_key2.dport = tcp_key.dport;
-			tcp_key2.sport = tcp_key.sport;
-			tcp_key2.daddr = tcp_key.daddr;
-
-			struct tcp_value_t tcp_value2 = {};
-			tcp_value2.pid = pid;
-			tcp_value2.saddr = tcp_value.saddr;
-			tcp_value2.counter = *val;
-
-			bpf_map_update_elem(&tcpMapEven, &tcp_key2, &tcp_value2, BPF_ANY);
-		}
-	}
-	else {
-		bpf_map_update_elem(&tcpMapEven, &tcp_key, &tcp_value, BPF_ANY);
-		if (modulo >= (MAPSIZE*2-MAPCACHESIZE) || modulo < (MAPSIZE+MAPCACHESIZE) ){
-			//mirror the the first and last MAPCACHESIZE entries in another map
-			struct tcp_key_t tcp_key2 = {};
-			tcp_key2.dport = tcp_key.dport;
-			tcp_key2.sport = tcp_key.sport;
-			tcp_key2.daddr = tcp_key.daddr;
-
-			struct tcp_value_t tcp_value2 = {};
-			tcp_value2.pid = pid;
-			tcp_value2.saddr = tcp_value.saddr;
-			tcp_value2.counter = *val;
-
-			bpf_map_update_elem(&tcpMapOdd, &tcp_key2, &tcp_value2, BPF_ANY);
-		}
-	}
+	bpf_map_update_elem(&tcpMap, &tcp_key, &tcp_value, BPF_ANY);
 	u64 newval = *val + 1;
 	bpf_map_update_elem(&tcpcounter, &zero_key, &newval, BPF_ANY);
 	bpf_map_delete_elem(&tcpsock, &pid);
@@ -301,21 +235,7 @@ int kretprobe__tcp_v6_connect(struct pt_regs *ctx)
 	u64 *val = bpf_map_lookup_elem(&tcpv6counter, &zero_key);
 	if (val == NULL){return 0;}
 	tcpv6_value.counter = *val;
-
-	u32 modulo = *val % (MAPSIZE*2);  
-	if (modulo < MAPSIZE){
-		bpf_map_update_elem(&tcpv6MapOdd, &tcpv6_key, &tcpv6_value, BPF_ANY);
-		if (modulo >= (MAPSIZE-MAPCACHESIZE) || modulo < MAPCACHESIZE){
-			bpf_map_update_elem(&tcpv6MapEven, &tcpv6_key, &tcpv6_value, BPF_ANY);
-		}
-	}
-	else {
-		bpf_map_update_elem(&tcpv6MapEven, &tcpv6_key, &tcpv6_value, BPF_ANY);
-		if (modulo >= (MAPSIZE*2-MAPCACHESIZE) || modulo < (MAPSIZE+MAPCACHESIZE)){
-			//mirror the last MAPCACHESIZE entries in another map
-			bpf_map_update_elem(&tcpv6MapOdd, &tcpv6_key, &tcpv6_value, BPF_ANY);
-		}
-	}
+	bpf_map_update_elem(&tcpv6Map, &tcpv6_key, &tcpv6_value, BPF_ANY);
 	u64 newval = *val + 1;
 	bpf_map_update_elem(&tcpv6counter, &zero_key, &newval, BPF_ANY);
 	bpf_map_delete_elem(&tcpv6sock, &pid);
@@ -369,36 +289,13 @@ int kprobe__udp_sendmsg(struct pt_regs *ctx)
 	int zero_key = 0;
 	u64 *counterVal = bpf_map_lookup_elem(&udpcounter, &zero_key);
 	if (counterVal == NULL){return 0;}
-	u32 modulo = *counterVal % (MAPSIZE*2);  
-	bool oddMap = (modulo < MAPSIZE) ? true : false;
-
-	struct udp_value_t *lookedupValue;
-	if (oddMap){
-		lookedupValue = bpf_map_lookup_elem(&udpMapOdd, &udp_key);
-	}
-	else {
-		lookedupValue = bpf_map_lookup_elem(&udpMapEven, &udp_key);
-	}
+	struct udp_value_t *lookedupValue = bpf_map_lookup_elem(&udpMap, &udp_key);
 	if ( lookedupValue == NULL || lookedupValue->pid != pid) {
 		struct udp_value_t udp_value = {};
 		udp_value.pid = pid;
 		udp_value.saddr = saddr;
 		udp_value.counter = *counterVal;
-
-		if (oddMap){
-			bpf_map_update_elem(&udpMapOdd, &udp_key, &udp_value, BPF_ANY);
-			if (modulo >= (MAPSIZE-MAPCACHESIZE) || modulo < MAPCACHESIZE){
-				//mirror the last 1000 entries in another map
-				bpf_map_update_elem(&udpMapEven, &udp_key, &udp_value, BPF_ANY);
-			}
-		}
-		else {
-			bpf_map_update_elem(&udpMapEven, &udp_key, &udp_value, BPF_ANY);
-			if (modulo >= (MAPSIZE*2-MAPCACHESIZE) || modulo < (MAPSIZE+MAPCACHESIZE)){
-				//mirror the last 1000 entries in another map
-				bpf_map_update_elem(&udpMapOdd, &udp_key, &udp_value, BPF_ANY);
-			}
-		}
+		bpf_map_update_elem(&udpMap, &udp_key, &udp_value, BPF_ANY);
 		u64 newval = *counterVal + 1;
 		bpf_map_update_elem(&udpcounter, &zero_key, &newval, BPF_ANY);
 	}
@@ -446,36 +343,13 @@ int kprobe__udpv6_sendmsg(struct pt_regs *ctx)
 	int zero_key = 0;
 	u64 *counterVal = bpf_map_lookup_elem(&udpv6counter, &zero_key);
 	if (counterVal == NULL){return 0;}
-	u32 modulo = *counterVal % (MAPSIZE*2);  
-	bool oddMap = (*counterVal % (MAPSIZE*2) <= MAPSIZE) ? true : false;
-
-	struct udpv6_value_t *lookedupValue;
-	if (oddMap){
-		lookedupValue = bpf_map_lookup_elem(&udpv6MapOdd, &udpv6_key);
-	}
-	else {
-		lookedupValue = bpf_map_lookup_elem(&udpv6MapEven, &udpv6_key);
-	}
+	struct udpv6_value_t *lookedupValue = bpf_map_lookup_elem(&udpv6Map, &udpv6_key);
 	if ( lookedupValue == NULL || lookedupValue->pid != pid) {
 		struct udpv6_value_t udpv6_value = {};
 		udpv6_value.pid = pid;
 		udpv6_value.saddr = saddr;
 		udpv6_value.counter = *counterVal;
-
-		if (oddMap){
-			bpf_map_update_elem(&udpv6MapOdd, &udpv6_key, &udpv6_value, BPF_ANY);
-			if (modulo >= (MAPSIZE-MAPCACHESIZE) || modulo < MAPCACHESIZE){
-				//mirror the last 1000 entries in another map
-				bpf_map_update_elem(&udpv6MapEven, &udpv6_key, &udpv6_value, BPF_ANY);
-			}
-		}
-		else {
-			bpf_map_update_elem(&udpv6MapEven, &udpv6_key, &udpv6_value, BPF_ANY);
-			if (modulo >= (MAPSIZE*2-MAPCACHESIZE) || modulo < (MAPSIZE+MAPCACHESIZE)){
-				//mirror the last 1000 entries in another map
-				bpf_map_update_elem(&udpv6MapOdd, &udpv6_key, &udpv6_value, BPF_ANY);
-			}
-		}
+		bpf_map_update_elem(&udpv6Map, &udpv6_key, &udpv6_value, BPF_ANY);
 		u64 newval = *counterVal + 1;
 		bpf_map_update_elem(&udpv6counter, &zero_key, &newval, BPF_ANY);	
 	}
