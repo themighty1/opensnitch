@@ -77,7 +77,7 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (
 		return nil, nil
 	}
 
-	//fmt.Printf("new connection %s => %d:%v -> %v:%d uid: \n", c.Protocol, c.SrcPort, c.SrcIP, c.DstIP, c.DstPort)
+	fmt.Printf("new connection %s => %d:%v -> %v:%d uid: \n", c.Protocol, c.SrcPort, c.SrcIP, c.DstIP, c.DstPort)
 
 	c.Entry = &netstat.Entry{
 		Proto:   c.Protocol,
@@ -165,7 +165,7 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (
 			loops = 0
 			stats = nil
 		}
-		//fmt.Println("found process:", c.Process.Path)
+		fmt.Println("found process:", c.Process.Path)
 		return c, nil
 	}
 
