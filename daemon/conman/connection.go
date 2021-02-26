@@ -36,6 +36,9 @@ type Connection struct {
 
 var showUnknownCons = false
 
+// some arbitrary value
+const kernelPID = -100
+
 // Parse extracts the IP layers from a network packet to determine what
 // process generated a connection.
 func Parse(nfp netfilter.Packet, interceptUnknown bool) *Connection {
@@ -103,8 +106,6 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (
 		//check if it comes from already established TCP
 		if c.Protocol == "tcp" || c.Protocol == "tcp6" {
 			var err error
-			//TODO: we should have a monitoring thread which queries netlink to see if the
-			//4-tuple + inode is still active. If not, it should be removed from already established
 			pid, err = ebpf.FindInAlreadyEstablishedTCP(c.Protocol, c.SrcPort, c.SrcIP, c.DstIP, c.DstPort)
 			if err == nil && pid != -1 {
 				fmt.Println("found in already established", pid)
@@ -115,14 +116,13 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (
 		//using netlink.GetSocketInfo to check the UID
 		uid, inodeList = netlink.GetSocketInfo(c.Protocol, c.SrcIP, c.SrcPort, c.DstIP, c.DstPort)
 		fmt.Println("Results from netlink", uid, inodeList)
-
-		// //else not found in ebpf.FindInAlreadyEstablished
 		if uid == 0 {
 			// must be an in-kernel connection
-			//TODO send a popup to user to accept/deny
+			// TODO send a popup to user to accept/deny
 			var proc procmon.Process
 			c.Process = &proc
-			c.Process.ID = os.Getpid()
+			c.Process.ID = kernelPID
+			c.Process.Path = "Linux kernel"
 			return c, nil
 		}
 
@@ -131,7 +131,7 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (
 			//and we get a packet here with source IP 8.8.8.8
 			//This must be some sort of in-kernel response with spoofed IP because wireshark does not show either
 			//resolved's TCP Fast Open packet, neither the response
-			//Until this mistery is understood, we simply do not allow this machine to make connections with
+			//Until this better is understood, we simply do not allow this machine to make connections with
 			//arbitrary source IPs
 			fmt.Println("Packet with unknown source IP")
 			return nil, fmt.Errorf("Packet with unknown source IP: %s", c.SrcIP)
@@ -141,12 +141,7 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (
 		ebpf.PrintEverything("1")
 		time.Sleep(time.Second * 1)
 		ebpf.PrintEverything("2")
-
-		fmt.Println("packet is", nfp)
-		for {
-			//spin forever while we dump all maps with bpftool in another terminal
-			time.Sleep(time.Second * 100)
-		}
+		return nil, nil
 
 	FoundPid:
 		stats = append(stats, time.Since(start).String())

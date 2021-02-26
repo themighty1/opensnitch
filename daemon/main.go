@@ -254,7 +254,7 @@ func acceptOrDeny(packet *netfilter.Packet, con *conman.Connection) *rule.Rule {
 		}
 
 		//check if the pulled out packet is the same we put in
-		if res := bytes.Compare(packet.Packet.Data(), pkt.Packet.Data()); res != 0 {
+		if !bytes.Equal(packet.Packet.Data(), pkt.Packet.Data()) {
 			log.Error("The packet which was requeued has changed abruptly. This should never happen. Please report this incident to the Opensnitch developers. %s %s ", packet, pkt)
 			fmt.Println("The packet which was requeued has changed abruptly")
 			return nil
@@ -389,7 +389,6 @@ func main() {
 	// the option via command line.
 	if procmonMethod != "" {
 		procmon.SetMonitorMethod(procmonMethod)
-		fmt.Println("procmonMethod", procmonMethod)
 	}
 	monitor.Init()
 
