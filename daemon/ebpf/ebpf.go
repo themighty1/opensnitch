@@ -94,7 +94,7 @@ func Start() error {
 	// init all counters to 0
 	zeroKey := make([]byte, 4)
 	zeroValue := make([]byte, 8)
-	for _, name := range []string{"tcpcounter", "tcpv6counter", "udpcounter", "udpv6counter"} {
+	for _, name := range []string{"tcpcounter", "tcpv6counter", "udpcounter", "udpv6counter", "debugcounter"} {
 		err := m.UpdateElement(m.Map(name), unsafe.Pointer(&zeroKey[0]), unsafe.Pointer(&zeroValue[0]), 0)
 		if err != nil {
 			return err
