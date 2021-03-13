@@ -42,13 +42,21 @@ struct tcp_key_t {
 struct tcp_value_t{
 	u32 pid;
 	u64 counter; //counters in value are for debug purposes only
-}__attribute__((packed));;
+}__attribute__((packed));
+
+// not using unsigned __int128 because it is not supported on 32-bit platforms
+struct ipV6 {
+	u64 part1;
+	u64 part2;
+};
 
 struct tcpv6_key_t {
 	u16 sport;
-	unsigned __int128 daddr;
+	struct ipV6 daddr;
+	//unsigned __int128 daddr;
 	u16 dport;
-	unsigned __int128 saddr;
+	struct ipV6 saddr;
+	//unsigned __int128 saddr;
 }__attribute__((packed));
 
 struct tcpv6_value_t{
@@ -74,9 +82,11 @@ struct udp_value_t{
 
 struct udpv6_key_t {
 	u16 sport;
-	unsigned __int128 daddr;
-	u16 dport; 
-	unsigned __int128 saddr;
+	struct ipV6 daddr;
+	//unsigned __int128 daddr;
+	u16 dport;
+	struct ipV6 saddr; 
+	//unsigned __int128 saddr;
 }__attribute__((packed));
 
 struct udpv6_value_t{
