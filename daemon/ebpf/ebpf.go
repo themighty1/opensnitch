@@ -279,8 +279,10 @@ func GetPid(proto string, srcPort uint, srcIP net.IP, dstIP net.IP, dstPort uint
 		binary.LittleEndian.PutUint16((*key)[0:2], uint16(srcPort))
 	}
 	bpf_lookup.map_fd = ebpfMaps[proto].bpfmapFd
-	r := makeBpfSyscall(bpf_lookup)
-	if r != 0 {
+	r := m.LookupElement(ebpfMaps[proto].bpfmap, unsafe.Pointer(&((*key)[0])), unsafe.Pointer(&bpfLookupValue[0]))
+
+	//r := makeBpfSyscall(bpf_lookup)
+	if r != nil {
 		fmt.Println("key not found", *key)
 		//maybe srcIP is 0.0.0.0 Happens especially with UDP sendto()
 		//TODO: can this happen with TCP?
@@ -291,9 +293,10 @@ func GetPid(proto string, srcPort uint, srcIP net.IP, dstIP net.IP, dstPort uint
 			zeroes := make([]byte, 16)
 			copy((*key)[20:36], zeroes)
 		}
-		r = makeBpfSyscall(bpf_lookup)
+		r = m.LookupElement(ebpfMaps[proto].bpfmap, unsafe.Pointer(&((*key)[0])), unsafe.Pointer(&bpfLookupValue[0]))
+		//r = makeBpfSyscall(bpf_lookup)
 	}
-	if r != 0 && proto == "udp" && srcIP.String() == "127.0.0.1" && dstIP.String() == "127.0.0.1" {
+	if r != nil && proto == "udp" && srcIP.String() == "127.0.0.1" && dstIP.String() == "127.0.0.1" {
 		fmt.Println("need investigation srcIP.String() == 127.0.0.1 ")
 		fmt.Println()
 		for {
@@ -303,9 +306,9 @@ func GetPid(proto string, srcPort uint, srcIP net.IP, dstIP net.IP, dstPort uint
 		//very rarely I see this connection. It has dstIP == 0.0.0.0 in ebpf map
 		//I could not reproduce it
 		copy((*key)[2:6], make([]byte, 4))
-		r = makeBpfSyscall(bpf_lookup)
+		//r = makeBpfSyscall(bpf_lookup)
 	}
-	if r != 0 {
+	if r != nil {
 		// key not found in bpf map
 		fmt.Println("key not found", *key)
 		return -1
