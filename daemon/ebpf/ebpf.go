@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
-	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -24,17 +23,7 @@ import (
 type ebpfMapsForProto struct {
 	counterMap    *elf.Map
 	bpfmap        *elf.Map
-	bpfmapFd      uint64 // ebpf map file descriptor
 	lastPurgedMax uint64 // max counter value up to and including which the map was purged on the last purge
-}
-
-//mimics union bpf_attr's anonymous struct used by BPF_MAP_*_ELEM commands
-//from <linux_headers>/include/uapi/linux/bpf.h
-type bpf_lookup_elem_t struct {
-	map_fd uint64 //even though in bpf.h its type is __u32, we must make it 8 bytes long
-	//because "key" is of type __aligned_u64, i.e. "key" must be aligned on an 8-byte boundary
-	key   uintptr
-	value uintptr
 }
 
 var (
@@ -45,14 +34,7 @@ var (
 	alreadyEstablishedTCP   = make(map[*daemonNetlink.Socket]int)
 	alreadyEstablishedTCPv6 = make(map[*daemonNetlink.Socket]int)
 	//stop will be set to true when all goroutines should stop
-	stop              = false
-	bpf_lookup_elem   bpf_lookup_elem_t
-	bpf_lookup_elemv6 bpf_lookup_elem_t
-	// keys/values for looking up bpf maps
-	bpfLookupKey     = make([]byte, 12)
-	bpfLookupKeyv6   = make([]byte, 36)
-	bpfLookupValue   = make([]byte, 12)
-	bpfLookupValuev6 = make([]byte, 12)
+	stop = false
 	// list of local addresses of this machine
 	localAddresses     []net.IP
 	localAddressesLock sync.RWMutex
@@ -94,36 +76,26 @@ func Start() error {
 	// init all counters to 0
 	zeroKey := make([]byte, 4)
 	zeroValue := make([]byte, 8)
-	for _, name := range []string{"tcpcounter", "tcpv6counter", "udpcounter", "udpv6counter", "debugcounter"} {
+	for _, name := range []string{"tcpcounter", "tcpv6counter", "udpcounter", "udpv6counter"} {
 		err := m.UpdateElement(m.Map(name), unsafe.Pointer(&zeroKey[0]), unsafe.Pointer(&zeroValue[0]), 0)
 		if err != nil {
 			return err
 		}
 	}
 
-	// prepare struct for bpf() syscall
-	bpf_lookup_elem.key = uintptr(unsafe.Pointer(&bpfLookupKey[0]))
-	bpf_lookup_elem.value = uintptr(unsafe.Pointer(&bpfLookupValue[0]))
-	bpf_lookup_elemv6.key = uintptr(unsafe.Pointer(&bpfLookupKeyv6[0]))
-	bpf_lookup_elemv6.value = uintptr(unsafe.Pointer(&bpfLookupValuev6[0]))
-
 	ebpfMaps = map[string]*ebpfMapsForProto{
 		"tcp": {lastPurgedMax: 0,
 			counterMap: m.Map("tcpcounter"),
-			bpfmap:     m.Map("tcpMap"),
-			bpfmapFd:   uint64(m.Map("tcpMap").Fd())},
+			bpfmap:     m.Map("tcpMap")},
 		"tcp6": {lastPurgedMax: 0,
 			counterMap: m.Map("tcpv6counter"),
-			bpfmap:     m.Map("tcpv6Map"),
-			bpfmapFd:   uint64(m.Map("tcpv6Map").Fd())},
+			bpfmap:     m.Map("tcpv6Map")},
 		"udp": {lastPurgedMax: 0,
 			counterMap: m.Map("udpcounter"),
-			bpfmap:     m.Map("udpMap"),
-			bpfmapFd:   uint64(m.Map("udpMap").Fd())},
+			bpfmap:     m.Map("udpMap")},
 		"udp6": {lastPurgedMax: 0,
 			counterMap: m.Map("udpv6counter"),
-			bpfmap:     m.Map("udpv6Map"),
-			bpfmapFd:   uint64(m.Map("udpv6Map").Fd())},
+			bpfmap:     m.Map("udpv6Map")},
 	}
 
 	// save already established connections
@@ -168,11 +140,11 @@ func deleteOld(bpfmap *elf.Map, isIPv6 bool, maxToDelete uint64) {
 	if !isIPv6 {
 		lookupKey = make([]byte, 12)
 		nextKey = make([]byte, 12)
-		value = make([]byte, 12)
+		value = make([]byte, 16)
 	} else {
 		lookupKey = make([]byte, 36)
 		nextKey = make([]byte, 36)
-		value = make([]byte, 12)
+		value = make([]byte, 16)
 	}
 	firstrun := true
 	log.Debug("start deleting old", maxToDelete)
@@ -198,7 +170,7 @@ func deleteOld(bpfmap *elf.Map, isIPv6 bool, maxToDelete uint64) {
 			continue
 		}
 		// last 8 bytes of value is counter value
-		counterValue := binary.LittleEndian.Uint64(value[4:12])
+		counterValue := binary.LittleEndian.Uint64(value[8:16])
 		if counterValue > maxToDelete {
 			copy(lookupKey, nextKey)
 			continue
@@ -252,69 +224,71 @@ func monitorMaps() {
 
 // struct tcp_value_t{
 // 	u64 pid;
-// 	u64 counter; //counters in value are for debug purposes only
+// 	u64 counter;
 // }__attribute__((packed));;
 
 func GetPid(proto string, srcPort uint, srcIP net.IP, dstIP net.IP, dstPort uint) int {
-	var key *[]byte
-	var bpf_lookup *bpf_lookup_elem_t
+	var key []byte
+	var value []byte
 	var isIP4 bool = (proto == "tcp") || (proto == "udp") || (proto == "udplite")
 
 	if isIP4 {
-		key = &bpfLookupKey
-		bpf_lookup = &bpf_lookup_elem
-		copy((*key)[2:6], dstIP)
-		binary.BigEndian.PutUint16((*key)[6:8], uint16(dstPort))
-		copy((*key)[8:12], srcIP)
+		key = make([]byte, 12)
+		value = make([]byte, 16)
+		copy(key[2:6], dstIP)
+		binary.BigEndian.PutUint16(key[6:8], uint16(dstPort))
+		copy(key[8:12], srcIP)
 	} else { // IPv6
-		key = &bpfLookupKeyv6
-		bpf_lookup = &bpf_lookup_elemv6
-		copy((*key)[2:18], dstIP)
-		binary.BigEndian.PutUint16((*key)[18:20], uint16(dstPort))
-		copy((*key)[20:36], srcIP)
+		key = make([]byte, 36)
+		value = make([]byte, 16)
+		copy(key[2:18], dstIP)
+		binary.BigEndian.PutUint16(key[18:20], uint16(dstPort))
+		copy(key[20:36], srcIP)
 	}
 	if proto == "tcp" || proto == "tcp6" {
-		binary.BigEndian.PutUint16((*key)[0:2], uint16(srcPort))
+		binary.BigEndian.PutUint16(key[0:2], uint16(srcPort))
 	} else { // non-TCP
-		binary.LittleEndian.PutUint16((*key)[0:2], uint16(srcPort))
+		binary.LittleEndian.PutUint16(key[0:2], uint16(srcPort))
 	}
-	bpf_lookup.map_fd = ebpfMaps[proto].bpfmapFd
-	r := m.LookupElement(ebpfMaps[proto].bpfmap, unsafe.Pointer(&((*key)[0])), unsafe.Pointer(&bpfLookupValue[0]))
-
-	//r := makeBpfSyscall(bpf_lookup)
-	if r != nil {
-		fmt.Println("key not found", *key)
+	err := m.LookupElement(ebpfMaps[proto].bpfmap, unsafe.Pointer(&key[0]), unsafe.Pointer(&value[0]))
+	if err != nil {
+		fmt.Println("key not found", key)
 		//maybe srcIP is 0.0.0.0 Happens especially with UDP sendto()
 		//TODO: can this happen with TCP?
 		if isIP4 {
 			zeroes := make([]byte, 4)
-			copy((*key)[8:12], zeroes)
+			copy(key[8:12], zeroes)
 		} else {
 			zeroes := make([]byte, 16)
-			copy((*key)[20:36], zeroes)
+			copy(key[20:36], zeroes)
 		}
-		r = m.LookupElement(ebpfMaps[proto].bpfmap, unsafe.Pointer(&((*key)[0])), unsafe.Pointer(&bpfLookupValue[0]))
-		//r = makeBpfSyscall(bpf_lookup)
+		err = m.LookupElement(ebpfMaps[proto].bpfmap, unsafe.Pointer(&key[0]), unsafe.Pointer(&value[0]))
 	}
-	if r != nil && proto == "udp" && srcIP.String() == "127.0.0.1" && dstIP.String() == "127.0.0.1" {
-		fmt.Println("need investigation srcIP.String() == 127.0.0.1 ")
-		fmt.Println()
-		for {
-			time.Sleep(time.Second)
-		}
-		os.Exit(1)
-		//very rarely I see this connection. It has dstIP == 0.0.0.0 in ebpf map
-		//I could not reproduce it
-		copy((*key)[2:6], make([]byte, 4))
-		//r = makeBpfSyscall(bpf_lookup)
+	if err != nil && proto == "udp" && srcIP.String() == dstIP.String() {
+		//very rarely I see this connection. It has srcIp and dstIP == 0.0.0.0 in ebpf map
+		//TODO try to reproduce it and look for srcIP/dstIP in other kernel structures
+		zeroes := make([]byte, 4)
+		copy(key[2:6], zeroes)
+		err = m.LookupElement(ebpfMaps[proto].bpfmap, unsafe.Pointer(&key[0]), unsafe.Pointer(&value[0]))
 	}
-	if r != nil {
+	if err != nil {
 		// key not found in bpf map
-		fmt.Println("key not found", *key)
+		fmt.Println("key not found", key)
 		return -1
 	}
-	pid := int(binary.LittleEndian.Uint32(bpfLookupValue[0:4]))
+	pid := int(binary.LittleEndian.Uint32(value[0:4]))
 	return pid
+}
+
+//Not in use, ~4usec faster lookup compared to m.LookupElement()
+
+//mimics union bpf_attr's anonymous struct used by BPF_MAP_*_ELEM commands
+//from <linux_headers>/include/uapi/linux/bpf.h
+type bpf_lookup_elem_t struct {
+	map_fd uint64 //even though in bpf.h its type is __u32, we must make it 8 bytes long
+	//because "key" is of type __aligned_u64, i.e. "key" must be aligned on an 8-byte boundary
+	key   uintptr
+	value uintptr
 }
 
 //make bpf() syscall with bpf_lookup prepared by the caller
@@ -441,7 +415,6 @@ func monitorAlreadyEstablished() {
 //PrintEverything prints all the stats. used only for debugging
 func PrintEverything(suffix string) {
 	bash, _ := exec.LookPath("bash")
-	fmt.Println("tcpoddfd is", ebpfMaps["tcp"].bpfmapFd)
 	cmd := exec.Command(bash, "-c", "bpftool map dump name tcpMap > tcpmap"+suffix)
 	if err := cmd.Run(); err != nil {
 		fmt.Println("bpftool map dump name tcpMap ", err)
