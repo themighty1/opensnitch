@@ -251,7 +251,7 @@ func monitorMaps() {
 // }__attribute__((packed));
 
 // struct tcp_value_t{
-// 	u32 pid;
+// 	u64 pid;
 // 	u64 counter; //counters in value are for debug purposes only
 // }__attribute__((packed));;
 
@@ -281,6 +281,7 @@ func GetPid(proto string, srcPort uint, srcIP net.IP, dstIP net.IP, dstPort uint
 	bpf_lookup.map_fd = ebpfMaps[proto].bpfmapFd
 	r := makeBpfSyscall(bpf_lookup)
 	if r != 0 {
+		fmt.Println("key not found", *key)
 		//maybe srcIP is 0.0.0.0 Happens especially with UDP sendto()
 		//TODO: can this happen with TCP?
 		if isIP4 {

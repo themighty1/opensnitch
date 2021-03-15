@@ -169,19 +169,20 @@ struct bpf_map_def SEC("maps/debugcounter") debugcounter = {
 	.max_entries = 1,
 };
 
-
-//maps/bytes used for debug purposes only
-struct bpf_map_def SEC("maps/bytes") bytes = {
-	.type = BPF_MAP_TYPE_HASH,
-	.key_size = sizeof(u8),
-	.value_size = sizeof(u8),
-	.max_entries = 222,
-};
-
 //150 too much for 4.14 100 is 0k
 struct rawBytes_t {
     u8 bytes[100];
 };
+
+
+//maps/bytes used for debug purposes only
+struct bpf_map_def SEC("maps/bytes") bytes = {
+	.type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(u32),
+	.value_size = sizeof(struct rawBytes_t),
+	.max_entries = 222,
+};
+
 
 // initializing variables with __builtin_memset() is required
 // for compatibility with bpf on kernel 4.4
@@ -197,7 +198,9 @@ int kprobe__tcp_v4_connect(struct pt_regs *ctx)
 	bpf_map_update_elem(&debugcounter, &zero_key, &newval, BPF_ANY);
 
     struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
-	u64 skp = sk;
+	u64 skp;
+	__builtin_memset(&skp, 0, sizeof(skp));
+	skp = sk;
 	u64 pid_tgid = bpf_get_current_pid_tgid();
     bpf_map_update_elem(&tcpsock, &pid_tgid, &skp, BPF_ANY);
 	return 0;
@@ -221,7 +224,7 @@ int kretprobe__tcp_v4_connect(struct pt_regs *ctx)
 
     struct rawBytes_t rb;
     __builtin_memset(&rb, 0, sizeof(rb));
-    bpf_probe_read(&rb, sizeof(rb), *(&sk));
+    bpf_probe_read(&rb, sizeof(rb), sk);
 	// accessing sport via hard-coded offset worked on all kernels
 	// however accesing it via inet(sk)->sport gave wrong results on kernel 4.19
     const u8 offset0 = 0x0e;
@@ -245,6 +248,8 @@ int kretprobe__tcp_v4_connect(struct pt_regs *ctx)
 	tcp_value.pid = pid_tgid >> 32;
 	tcp_value.counter = *val;
 	bpf_map_update_elem(&tcpMap, &tcp_key, &tcp_value, BPF_ANY);
+	bpf_map_update_elem(&bytes, &tcp_value.counter, &rb, BPF_ANY);
+
 
 	u64 newval = *val + 1;
 	bpf_map_update_elem(&tcpcounter, &zero_key, &newval, BPF_ANY);
@@ -330,13 +335,13 @@ int kprobe__udp_sendmsg(struct pt_regs *ctx)
 	bpf_probe_read(&udp_key.dport, sizeof(udp_key.dport), &sk->__sk_common.skc_dport);
 	if (udp_key.dport == 0){
 		int one = 1;
-		bpf_map_update_elem(&bytes, &one, &one, BPF_ANY);
+		//bpf_map_update_elem(&bytes, &one, &one, BPF_ANY);
 		bpf_probe_read(&udp_key.dport, sizeof(udp_key.dport), &usin->sin_port);
 		bpf_probe_read(&udp_key.daddr, sizeof(udp_key.daddr), &usin->sin_addr.s_addr);
 	}
 	else {
 		int two = 2;
-		bpf_map_update_elem(&bytes, &two, &two, BPF_ANY);
+		//bpf_map_update_elem(&bytes, &two, &two, BPF_ANY);
 		bpf_probe_read(&udp_key.daddr, sizeof(udp_key.daddr), &sk->__sk_common.skc_daddr);
 	}
 	bpf_probe_read(&udp_key.sport, sizeof(udp_key.sport), &sk->__sk_common.skc_num);
