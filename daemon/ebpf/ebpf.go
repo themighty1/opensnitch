@@ -284,7 +284,6 @@ func GetPid(proto string, srcPort uint, srcIP net.IP, dstIP net.IP, dstPort uint
 	var value []byte
 	var isIP4 bool = (proto == "tcp") || (proto == "udp") || (proto == "udplite")
 
-	hostByteOrder.PutUint16(key[0:2], uint16(srcPort))
 	if isIP4 {
 		key = make([]byte, 12)
 		value = make([]byte, 16)
@@ -298,6 +297,7 @@ func GetPid(proto string, srcPort uint, srcIP net.IP, dstIP net.IP, dstPort uint
 		binary.BigEndian.PutUint16(key[18:20], uint16(dstPort))
 		copy(key[20:36], srcIP)
 	}
+	hostByteOrder.PutUint16(key[0:2], uint16(srcPort))
 
 	err := m.LookupElement(ebpfMaps[proto].bpfmap, unsafe.Pointer(&key[0]), unsafe.Pointer(&value[0]))
 	if err != nil {
