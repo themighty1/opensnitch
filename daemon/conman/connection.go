@@ -141,7 +141,9 @@ func newConnectionImpl(nfp *netfilter.Packet, c *Connection, protoType string) (
 		ebpf.PrintEverything("1")
 		time.Sleep(time.Second * 1)
 		ebpf.PrintEverything("2")
-		os.Exit(1)
+		for {
+			time.Sleep(time.Second)
+		}
 		return nil, nil
 
 	FoundPid:

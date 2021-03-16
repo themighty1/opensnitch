@@ -219,19 +219,19 @@ int kretprobe__tcp_v4_connect(struct pt_regs *ctx)
     __builtin_memset(&tcp_key, 0, sizeof(tcp_key));
 	bpf_probe_read(&tcp_key.dport, sizeof(tcp_key.dport), &sk->__sk_common.skc_dport);
 
-    struct rawBytes_t rb;
-    __builtin_memset(&rb, 0, sizeof(rb));
-    bpf_probe_read(&rb, sizeof(rb), sk);
-	// accessing sport via hard-coded offset worked on all kernels
-	// however accesing it via inet(sk)->sport gave wrong results on kernel 4.19
-    const u8 offset0 = 0x0e;
-    const u8 offset1 = 0x0f;
-    // u8 port[2] = {0,0}; don't init like this, it will be optimized away by clang
-    u8 port_bytes[2];
-    port_bytes[1] = rb.bytes[offset0];
-    port_bytes[0] = rb.bytes[offset1];
-    u16 *sport = (u16 *)&port_bytes;
-    tcp_key.sport = *sport;
+    // struct rawBytes_t rb;
+    // __builtin_memset(&rb, 0, sizeof(rb));
+    // bpf_probe_read(&rb, sizeof(rb), sk);
+	// // accessing sport via hard-coded offset worked on all kernels
+	// // however accesing it via inet(sk)->sport gave wrong results on kernel 4.19
+    // const u8 offset0 = 0x0e;
+    // const u8 offset1 = 0x0f;
+    // // u8 port[2] = {0,0}; don't init like this, it will be optimized away by clang
+    // u8 port_bytes[2];
+    // port_bytes[1] = rb.bytes[offset0];
+    // port_bytes[0] = rb.bytes[offset1];
+    // u16 *sport = (u16 *)&port_bytes;
+    // tcp_key.sport = *sport;
        
 	bpf_probe_read(&tcp_key.sport, sizeof(tcp_key.sport), &sk->__sk_common.skc_num);
 	bpf_probe_read(&tcp_key.daddr, sizeof(tcp_key.daddr), &sk->__sk_common.skc_daddr);
@@ -283,20 +283,21 @@ int kretprobe__tcp_v6_connect(struct pt_regs *ctx)
     __builtin_memset(&tcpv6_key, 0, sizeof(tcpv6_key));
 	bpf_probe_read(&tcpv6_key.dport, sizeof(tcpv6_key.dport), &sk->__sk_common.skc_dport);
 
-	struct rawBytes_t rb;
-    __builtin_memset(&rb, 0, sizeof(rb));
-    bpf_probe_read(&rb, sizeof(rb), *(&sk));
-	// accessing sport via hard-coded offset worked on all kernels
-	// however accesing it via inet(sk)->sport gave wrong results on kernel 4.19
-    const u8 offset0 = 0x0e;
-    const u8 offset1 = 0x0f;
-    // u8 port[2] = {0,0}; don't init like this, it will be optimized away by clang
-    u8 port_bytes[2];
-    port_bytes[1] = rb.bytes[offset0];
-    port_bytes[0] = rb.bytes[offset1];
-    u16 *sport = (u16 *)&port_bytes;
-    tcpv6_key.sport = *sport;
+	// struct rawBytes_t rb;
+    // __builtin_memset(&rb, 0, sizeof(rb));
+    // bpf_probe_read(&rb, sizeof(rb), *(&sk));
+	// // accessing sport via hard-coded offset worked on all kernels
+	// // however accesing it via inet(sk)->sport gave wrong results on kernel 4.19
+    // const u8 offset0 = 0x0e;
+    // const u8 offset1 = 0x0f;
+    // // u8 port[2] = {0,0}; don't init like this, it will be optimized away by clang
+    // u8 port_bytes[2];
+    // port_bytes[1] = rb.bytes[offset0];
+    // port_bytes[0] = rb.bytes[offset1];
+    // u16 *sport = (u16 *)&port_bytes;
+    // tcpv6_key.sport = *sport;
 
+	bpf_probe_read(&tcpv6_key.sport, sizeof(tcpv6_key.sport), &sk->__sk_common.skc_num);
 	bpf_probe_read(&tcpv6_key.daddr, sizeof(tcpv6_key.daddr), &sk->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
 	bpf_probe_read(&tcpv6_key.saddr, sizeof(tcpv6_key.saddr), &sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
 
