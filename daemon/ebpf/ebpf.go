@@ -38,6 +38,7 @@ var (
 	// list of local addresses of this machine
 	localAddresses     []net.IP
 	localAddressesLock sync.RWMutex
+	hostByteOrder      binary.ByteOrder
 )
 
 // returns a random string
@@ -53,6 +54,7 @@ func randString() string {
 
 //Start installs ebpf kprobes
 func Start() error {
+
 	m = elf.NewModule("opensnitch.o")
 	if err := m.Load(nil); err != nil {
 		log.Error("m.Load", err)
@@ -81,6 +83,18 @@ func Start() error {
 		if err != nil {
 			return err
 		}
+	}
+
+	//determine host byte order
+	buf := [2]byte{}
+	*(*uint16)(unsafe.Pointer(&buf[0])) = uint16(0xABCD)
+	switch buf {
+	case [2]byte{0xCD, 0xAB}:
+		hostByteOrder = binary.LittleEndian
+	case [2]byte{0xAB, 0xCD}:
+		hostByteOrder = binary.BigEndian
+	default:
+		panic("Could not determine host byte order.")
 	}
 
 	ebpfMaps = map[string]*ebpfMapsForProto{
@@ -132,6 +146,44 @@ func Stop() {
 	m.Close()
 }
 
+func dumpMap(bpfmap *elf.Map, isIPv6 bool) {
+	var lookupKey []byte
+	var nextKey []byte
+	var value []byte
+	if !isIPv6 {
+		lookupKey = make([]byte, 12)
+		nextKey = make([]byte, 12)
+		value = make([]byte, 16)
+	} else {
+		lookupKey = make([]byte, 36)
+		nextKey = make([]byte, 36)
+		value = make([]byte, 16)
+	}
+	firstrun := true
+	i := 0
+	for {
+		i++
+		ok, err := m.LookupNextElement(bpfmap, unsafe.Pointer(&lookupKey[0]),
+			unsafe.Pointer(&nextKey[0]), unsafe.Pointer(&value[0]))
+		if err != nil {
+			log.Error("LookupNextElement error", err)
+			return
+		}
+		if firstrun {
+			// on first run lookupKey is a dummy, nothing to delete
+			firstrun = false
+			copy(lookupKey, nextKey)
+			continue
+		}
+		fmt.Println("key, value", lookupKey, value)
+
+		if !ok { //reached end of map
+			break
+		}
+		copy(lookupKey, nextKey)
+	}
+}
+
 // delete all map's elements whose counter value is <= maxToDelete
 func deleteOld(bpfmap *elf.Map, isIPv6 bool, maxToDelete uint64) {
 	var lookupKey []byte
@@ -170,7 +222,7 @@ func deleteOld(bpfmap *elf.Map, isIPv6 bool, maxToDelete uint64) {
 			continue
 		}
 		// last 8 bytes of value is counter value
-		counterValue := binary.LittleEndian.Uint64(value[8:16])
+		counterValue := hostByteOrder.Uint64(value[8:16])
 		if counterValue > maxToDelete {
 			copy(lookupKey, nextKey)
 			continue
@@ -202,7 +254,7 @@ func monitorMaps() {
 				unsafe.Pointer(&zeroKey[0]), unsafe.Pointer(&value[0])); err != nil {
 				log.Error("m.LookupElement", err)
 			}
-			counterValue := binary.LittleEndian.Uint64(value)
+			counterValue := hostByteOrder.Uint64(value)
 			//fmt.Println("counterValue, ebpfMap.lastPurgedMax", counterValue, ebpfMap.lastPurgedMax)
 			if counterValue-ebpfMap.lastPurgedMax > 10000 {
 				ebpfMap.lastPurgedMax = counterValue - 5000
@@ -248,7 +300,7 @@ func GetPid(proto string, srcPort uint, srcIP net.IP, dstIP net.IP, dstPort uint
 	if proto == "tcp" || proto == "tcp6" {
 		binary.BigEndian.PutUint16(key[0:2], uint16(srcPort))
 	} else { // non-TCP
-		binary.LittleEndian.PutUint16(key[0:2], uint16(srcPort))
+		hostByteOrder.PutUint16(key[0:2], uint16(srcPort))
 	}
 	err := m.LookupElement(ebpfMaps[proto].bpfmap, unsafe.Pointer(&key[0]), unsafe.Pointer(&value[0]))
 	if err != nil {
@@ -265,8 +317,9 @@ func GetPid(proto string, srcPort uint, srcIP net.IP, dstIP net.IP, dstPort uint
 		err = m.LookupElement(ebpfMaps[proto].bpfmap, unsafe.Pointer(&key[0]), unsafe.Pointer(&value[0]))
 	}
 	if err != nil && proto == "udp" && srcIP.String() == dstIP.String() {
-		//very rarely I see this connection. It has srcIp and dstIP == 0.0.0.0 in ebpf map
-		//TODO try to reproduce it and look for srcIP/dstIP in other kernel structures
+		// very rarely I see this connection. It has srcIp and dstIP == 0.0.0.0 in ebpf map
+		// it is a localhost to localhost connection
+		// TODO try to reproduce it and look for srcIP/dstIP in other kernel structures
 		zeroes := make([]byte, 4)
 		copy(key[2:6], zeroes)
 		err = m.LookupElement(ebpfMaps[proto].bpfmap, unsafe.Pointer(&key[0]), unsafe.Pointer(&value[0]))
@@ -276,7 +329,7 @@ func GetPid(proto string, srcPort uint, srcIP net.IP, dstIP net.IP, dstPort uint
 		fmt.Println("key not found", key)
 		return -1
 	}
-	pid := int(binary.LittleEndian.Uint32(value[0:4]))
+	pid := int(hostByteOrder.Uint32(value[0:4]))
 	return pid
 }
 

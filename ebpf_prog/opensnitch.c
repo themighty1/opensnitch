@@ -233,6 +233,7 @@ int kretprobe__tcp_v4_connect(struct pt_regs *ctx)
     u16 *sport = (u16 *)&port_bytes;
     tcp_key.sport = *sport;
        
+	bpf_probe_read(&tcp_key.sport, sizeof(tcp_key.sport), &sk->__sk_common.skc_num);
 	bpf_probe_read(&tcp_key.daddr, sizeof(tcp_key.daddr), &sk->__sk_common.skc_daddr);
 	bpf_probe_read(&tcp_key.saddr, sizeof(tcp_key.saddr), &sk->__sk_common.skc_rcv_saddr);
 	
