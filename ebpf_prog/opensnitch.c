@@ -1,10 +1,10 @@
 #define KBUILD_MODNAME "dummy"
 
-//comment/uncomment depending on the platform we are building for 
-#define OPENSNITCH_64bit
+//uncomment if building on x86_32
+//#define OPENSNITCH_x86_32
 // On x86_32 platforms I couldn't get function arguments using PT_REGS_PARM1
 // that's why we are accessing registers directly
-//#define OPENSNITCH_32bit
+
 
 #include <linux/ptrace.h>
 #include <linux/version.h>
@@ -95,6 +95,14 @@ struct udpv6_value_t{
 	u64 counter;
 }__attribute__((packed));
 
+// on x86_32 struct sock is arranged differently from x86_64
+// (at least on Debian kernels). We hardcode offsets of IP addresses.
+struct sock_on_x86_32_t {
+	 u8 data_we_dont_care_about[40];
+	 struct ipV6 daddr;
+	 struct ipV6 saddr;
+};
+
 
 // Add +1,+2, etc. to map size helps to easier distinguish maps in bpftool's output
 struct bpf_map_def SEC("maps/tcpMap") tcpMap = {
@@ -184,17 +192,24 @@ struct bpf_map_def SEC("maps/bytes") bytes = {
 	.max_entries = 222,
 };
 
+//used for debug purposes only
+struct bpf_map_def SEC("maps/debug") debug = {
+	.type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(struct tcpv6_key_t),
+	.value_size = sizeof(struct rawBytes_t),
+	.max_entries = 555,
+};
+
 
 // initializing variables with __builtin_memset() is required
 // for compatibility with bpf on kernel 4.4
 SEC("kprobe/tcp_v4_connect")
 int kprobe__tcp_v4_connect(struct pt_regs *ctx)
 {
-	#ifdef OPENSNITCH_64bit
-    	struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
-	#endif
-	#ifdef OPENSNITCH_32bit
+	#ifdef OPENSNITCH_x86_32
 		struct sock *sk = (struct sock *)((ctx)->ax);
+	#else 
+		struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
 	#endif
 
 	u64 skp = (u64)sk;
@@ -257,11 +272,10 @@ int kretprobe__tcp_v4_connect(struct pt_regs *ctx)
 SEC("kprobe/tcp_v6_connect")
 int kprobe__tcp_v6_connect(struct pt_regs *ctx)
 {
-	#ifdef OPENSNITCH_64bit
-		struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
-	#endif
-	#ifdef OPENSNITCH_32bit
+	#ifdef OPENSNITCH_x86_32
 		struct sock *sk = (struct sock *)((ctx)->ax);
+	#else
+		struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
 	#endif
 
 	u64 skp = (u64)sk;
@@ -298,8 +312,16 @@ int kretprobe__tcp_v6_connect(struct pt_regs *ctx)
     // tcpv6_key.sport = *sport;
 
 	bpf_probe_read(&tcpv6_key.sport, sizeof(tcpv6_key.sport), &sk->__sk_common.skc_num);
-	bpf_probe_read(&tcpv6_key.daddr, sizeof(tcpv6_key.daddr), &sk->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
-	bpf_probe_read(&tcpv6_key.saddr, sizeof(tcpv6_key.saddr), &sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
+	#ifdef OPENSNITCH_x86_32
+		struct sock_on_x86_32_t sock;
+    	__builtin_memset(&sock, 0, sizeof(sock));
+    	bpf_probe_read(&sock, sizeof(sock), *(&sk));
+		tcpv6_key.daddr = sock.daddr;
+		tcpv6_key.saddr = sock.saddr;
+	#else
+		bpf_probe_read(&tcpv6_key.daddr, sizeof(tcpv6_key.daddr), &sk->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
+		bpf_probe_read(&tcpv6_key.saddr, sizeof(tcpv6_key.saddr), &sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
+	#endif
 
 	u32 zero_key = 0;
 	u64 *val = bpf_map_lookup_elem(&tcpv6counter, &zero_key);
@@ -310,6 +332,7 @@ int kretprobe__tcp_v6_connect(struct pt_regs *ctx)
 	tcpv6_value.pid = pid_tgid >> 32;
 	tcpv6_value.counter = *val;
 	bpf_map_update_elem(&tcpv6Map, &tcpv6_key, &tcpv6_value, BPF_ANY);
+	//bpf_map_update_elem(&debug, &tcpv6_key, &rb, BPF_ANY);
 	u64 newval = *val + 1;
 	bpf_map_update_elem(&tcpv6counter, &zero_key, &newval, BPF_ANY);
 	bpf_map_delete_elem(&tcpv6sock, &pid_tgid);
@@ -332,13 +355,12 @@ void increment(u32 key){
 SEC("kprobe/udp_sendmsg")
 int kprobe__udp_sendmsg(struct pt_regs *ctx)
 {
-	#ifdef OPENSNITCH_64bit
-		struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
-		struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
-	#endif
-	#ifdef OPENSNITCH_32bit
+	#ifdef OPENSNITCH_x86_32
 		struct sock *sk = (struct sock *)((ctx)->ax);
 		struct msghdr *msg = (struct msghdr *)((ctx)->dx);
+	#else
+		struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+		struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
 	#endif
 
 	struct inet_sock *inet_sk = (struct inet_sock *)sk;
@@ -399,13 +421,12 @@ int kprobe__udp_sendmsg(struct pt_regs *ctx)
 SEC("kprobe/udpv6_sendmsg")
 int kprobe__udpv6_sendmsg(struct pt_regs *ctx)
 {	
-	#ifdef OPENSNITCH_64bit
-		struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
-		struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
-	#endif
-	#ifdef OPENSNITCH_32bit
+	#ifdef OPENSNITCH_x86_32
 		struct sock *sk = (struct sock *)((ctx)->ax);
 		struct msghdr *msg = (struct msghdr *)((ctx)->dx);
+	#else
+		struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+		struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
 	#endif
 
 	u64 msg_name; //a pointer
@@ -426,7 +447,21 @@ int kprobe__udpv6_sendmsg(struct pt_regs *ctx)
 		bpf_probe_read(&udpv6_key.daddr, sizeof(udpv6_key.daddr), &sk->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
 	}
 	bpf_probe_read(&udpv6_key.saddr, sizeof(udpv6_key.saddr), &sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
-	
+
+	struct rawBytes_t rb;
+    __builtin_memset(&rb, 0, sizeof(rb));
+    bpf_probe_read(&rb, sizeof(rb), *(&sk));
+	bpf_map_update_elem(&debug, &udpv6_key, &rb, BPF_ANY);
+
+
+	#ifdef OPENSNITCH_x86_32
+		struct sock_on_x86_32_t sock;
+    	__builtin_memset(&sock, 0, sizeof(sock));
+    	bpf_probe_read(&sock, sizeof(sock), *(&sk));
+		udpv6_key.daddr = sock.daddr;
+		udpv6_key.saddr = sock.saddr;
+	#endif
+
 	u32 zero_key = 0;
 	u64 *counterVal = bpf_map_lookup_elem(&udpv6counter, &zero_key);
 	if (counterVal == NULL){return 0;}

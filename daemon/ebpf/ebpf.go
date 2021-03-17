@@ -55,7 +55,7 @@ func randString() string {
 //Start installs ebpf kprobes
 func Start() error {
 
-	m = elf.NewModule("opensnitch.o")
+	m = elf.NewModule("/etc/opensnitchd/opensnitch.o")
 	if err := m.Load(nil); err != nil {
 		log.Error("m.Load", err)
 		return err
